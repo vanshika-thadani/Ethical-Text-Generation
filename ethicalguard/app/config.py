@@ -99,3 +99,25 @@ INSTRUCTION_PROMPT_TEMPLATE: str = (
 # This neutral, safe sentence is substituted whenever that happens so the
 # scoring pipeline never receives an empty string.
 EMPTY_OUTPUT_FALLBACK: str = "I recommend expressing your feelings honestly and respectfully."
+
+# ---------------------------------------------------------------------------
+# RAG / Vector DB settings
+# ---------------------------------------------------------------------------
+# VECTORDB_PATH      : where FAISS index files are persisted between restarts.
+# RAG_COLLECTION_NAME: logical name (used as a label, not a DB collection).
+# RAG_TOP_K          : default number of chunks to retrieve per question.
+# CHUNK_SIZE         : target words per chunk during document ingestion.
+# CHUNK_OVERLAP      : words shared between consecutive chunks (preserves
+#                      context at boundaries so no sentence is cut in half).
+# UPLOAD_DIR         : where uploaded files are saved before ingestion.
+
+VECTORDB_PATH: str = os.getenv("VECTORDB_PATH", "vectordb")
+RAG_COLLECTION_NAME: str = "ethicalguard_docs"
+RAG_TOP_K: int = 3
+CHUNK_SIZE: int = 400
+CHUNK_OVERLAP: int = 80
+UPLOAD_DIR: str = "uploads"
+
+# Chunks with ethics_score below this threshold are flagged as unsafe
+# in the /analyze-document endpoint.
+CHUNK_ANALYSIS_FLAG_THRESHOLD: float = 0.6

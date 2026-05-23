@@ -99,3 +99,93 @@ class CompareResponse(BaseModel):
     baseline_scores: CandidateScores
     safety_ranked_scores: CandidateScores
     improvement: ImprovementMetrics
+
+
+# ---------------------------------------------------------------------------
+# RAG request / response schemas
+# ---------------------------------------------------------------------------
+
+class UploadResponse(BaseModel):
+    """Returned after a successful document upload and ingestion."""
+    status: str = "success"
+    document_name: str
+    chunks_added: int
+
+
+class AskRequest(BaseModel):
+    """
+    Body for POST /ask.
+
+    question      : the user's natural-language question about the document
+    top_k         : how many chunks to retrieve from the vector DB
+    document_name : optional — restrict retrieval to a specific document
+    max_tokens    : tokens to generate for the answer
+    alpha         : ethics/fluency weight for reranking the answer
+    """
+    question: str = Field(..., min_length=3, description="Question about the document")
+    top_k: int = Field(default=3, ge=1, le=10)
+    document_name: Optional[str] = Field(default=None, description="Filter by document name")
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=10, le=200)
+    alpha: float = Field(default=DEFAULT_ALPHA, ge=0.0, le=1.0)
+
+
+class RetrievedChunk(BaseModel):
+    """A single chunk returned by the retrieval step."""
+    text: str
+    document: str
+    chunk_index: int
+    distance: float   # cosine distance — lower means more relevant
+
+
+class AskResponse(BaseModel):
+    question: str
+    retrieved_chunks: List[RetrievedChunk]
+    answer: str
+    ethical_scores: CandidateScores
+
+
+class ChunkAnalysis(BaseModel):
+    """Ethical analysis result for a single document chunk."""
+    chunk: str
+    chunk_index: int
+    toxicity_score: float
+    bias_score: float
+    manipulation_penalty: float
+    ethics_score: float
+    # Flag: True if any metric is below the safe threshold
+    flagged: bool
+
+
+class AnalyzeDocumentRequest(BaseModel):
+    """Body for POST /analyze-document."""
+    document_name: str = Field(..., description="Name of the previously uploaded document")
+
+
+class AnalyzeDocumentResponse(BaseModel):
+    document_name: str
+    total_chunks: int
+    flagged_chunks: int
+    unsafe_chunks: List[ChunkAnalysis]
+    all_chunks: List[ChunkAnalysis]
+
+
+class RewriteRequest(BaseModel):
+    """Body for POST /rewrite."""
+    text: str = Field(..., min_length=3, description="Text to rewrite ethically")
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=10, le=200)
+    beams: int = Field(default=DEFAULT_BEAMS, ge=1, le=10)
+    alpha: float = Field(default=DEFAULT_ALPHA, ge=0.0, le=1.0)
+
+
+class RewriteResponse(BaseModel):
+    original: str
+    ethical_rewrite: str
+    scores_before: CandidateScores
+    scores_after: CandidateScores
+
+
+class RAGStatusResponse(BaseModel):
+    """Returned by GET /rag-status."""
+    status: str
+    total_chunks: int
+    documents: List[str]

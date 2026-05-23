@@ -13,6 +13,14 @@ venv/
 results/evaluation_results.csv
 results/summary.json
 
+# Uploaded documents (transient — not source code)
+uploads/*
+!uploads/README.md
+
+# ChromaDB vector store (rebuilt from uploads — not source code)
+vectordb/*
+!vectordb/README.md
+
 # Test cache
 .pytest_cache/
 

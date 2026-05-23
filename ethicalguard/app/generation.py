@@ -130,6 +130,13 @@ def load_models() -> str:
         gen_model=gen_model,
     )
 
+    # ---- 6. Share the SBERT model with rag.py and init vector DB ----
+    # RAG reuses the same SBERT instance already loaded by scoring.py
+    # so we never load it twice.
+    from app import rag
+    rag.set_rag_sbert_model(scoring._sbert_model)
+    rag.init_vector_db()
+
     logger.info("All models loaded successfully.")
     return _model_name_loaded
 
