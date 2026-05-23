@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# Evaluation results (generated at runtime — not source code)
+results/evaluation_results.csv
+results/summary.json
+
+# Test cache
+.pytest_cache/
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace model cache (large, downloaded automatically)
+.cache/
