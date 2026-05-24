@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { ScanSearch, AlertTriangle, CheckCircle, AlertCircle, ChevronDown } from 'lucide-react';
-import { analyzeDocument, getErrorMessage } from '../services/api';
+import { ScanSearch, AlertTriangle, CheckCircle, AlertCircle, ChevronDown, Wand2, RefreshCw } from 'lucide-react';
+import { analyzeDocument, rewriteText, getErrorMessage } from '../services/api';
 import type { AnalyzeDocumentResponse, ChunkAnalysis } from '../types/api';
 import LoadingSpinner from './LoadingSpinner';
 import ScoreBar from './ScoreBar';
@@ -9,44 +9,113 @@ interface Props {
   activeDocument: string;
 }
 
-function ChunkCard({ chunk, index }: { chunk: ChunkAnalysis; index: number }) {
+// ── Severity helpers ────────────────────────────────────────────────────────
+
+const SEVERITY_CONFIG = {
+  HIGH:   { bg: 'bg-rose-50',   border: 'border-rose-300',   badge: 'bg-rose-100 text-rose-700',   highlight: 'bg-rose-100',   label: 'HIGH RISK' },
+  MEDIUM: { bg: 'bg-orange-50', border: 'border-orange-300', badge: 'bg-orange-100 text-orange-700', highlight: 'bg-orange-100', label: 'MEDIUM RISK' },
+  LOW:    { bg: 'bg-white',     border: 'border-slate-200',  badge: 'bg-emerald-100 text-emerald-700', highlight: '', label: 'SAFE' },
+};
+
+// ── Chunk card ──────────────────────────────────────────────────────────────
+
+function ChunkCard({ chunk }: { chunk: ChunkAnalysis }) {
   const [open, setOpen] = useState(false);
+  const [rewriting, setRewriting] = useState(false);
+  const [rewrite, setRewrite] = useState('');
+  const [rewriteError, setRewriteError] = useState('');
+
+  const cfg = SEVERITY_CONFIG[chunk.severity] ?? SEVERITY_CONFIG.LOW;
+
+  async function handleInlineRewrite() {
+    setRewriting(true);
+    setRewriteError('');
+    setRewrite('');
+    try {
+      const res = await rewriteText(chunk.chunk);
+      setRewrite(res.ethical_rewrite);
+    } catch (e) {
+      setRewriteError(getErrorMessage(e));
+    } finally {
+      setRewriting(false);
+    }
+  }
 
   return (
-    <div className={`rounded-2xl border p-4 space-y-3 ${chunk.flagged ? 'border-rose-200 bg-rose-50' : 'border-slate-200 bg-white'}`}>
+    <div className={`rounded-2xl border ${cfg.border} ${cfg.bg} p-4 space-y-3`}>
+      {/* Header row */}
       <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {chunk.flagged
             ? <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
             : <CheckCircle className="w-4 h-4 text-emerald-500 shrink-0" />}
-          <span className="text-xs font-semibold text-slate-500">Chunk {index + 1}</span>
-          {chunk.flagged && (
-            <span className="text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded-full font-medium">Flagged</span>
+          <span className="text-xs font-semibold text-slate-500">Chunk {chunk.chunk_index + 1}</span>
+          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${cfg.badge}`}>
+            {cfg.label}
+          </span>
+          {/* Colour-coded risk type badges */}
+          {chunk.toxicity_score < 0.6 && (
+            <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium">Toxic</span>
+          )}
+          {chunk.manipulation_penalty > 0.1 && (
+            <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">Manipulative</span>
+          )}
+          {chunk.bias_score < 0.6 && (
+            <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full font-medium">Biased</span>
           )}
         </div>
-        <button onClick={() => setOpen(v => !v)} className="text-slate-400 hover:text-slate-600">
+        <button onClick={() => setOpen(v => !v)} className="text-slate-400 hover:text-slate-600 shrink-0">
           <ChevronDown className={`w-4 h-4 transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
       </div>
 
       {/* Score bars */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <ScoreBar label="Toxicity Safety" value={chunk.toxicity_score} />
-        <ScoreBar label="Bias Safety"     value={chunk.bias_score} />
-        <ScoreBar label="Ethics Score"    value={chunk.ethics_score} />
+        <ScoreBar label="Toxicity Safety"      value={chunk.toxicity_score} />
+        <ScoreBar label="Bias Safety"          value={chunk.bias_score} />
+        <ScoreBar label="Ethics Score"         value={chunk.ethics_score} />
         <ScoreBar label="Manipulation Penalty" value={chunk.manipulation_penalty} invert />
       </div>
 
-      {/* Chunk text (expandable) */}
+      {/* Expandable chunk text with colour highlight */}
       {open && (
-        <div className="bg-white border border-slate-200 rounded-xl p-3">
+        <div className={`rounded-xl border border-slate-200 p-3 ${cfg.highlight}`}>
           <p className="text-xs font-semibold text-slate-400 mb-1">Chunk Text</p>
-          <p className="text-sm text-slate-600 leading-relaxed">{chunk.chunk}</p>
+          <p className="text-sm text-slate-700 leading-relaxed">{chunk.chunk}</p>
+        </div>
+      )}
+
+      {/* Inline rewrite button — only for flagged chunks */}
+      {chunk.flagged && (
+        <div className="pt-1 space-y-2">
+          <button
+            onClick={handleInlineRewrite}
+            disabled={rewriting}
+            className="flex items-center gap-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold px-3 py-1.5 rounded-lg transition-colors"
+          >
+            {rewriting
+              ? <RefreshCw className="w-3 h-3 animate-spin" />
+              : <Wand2 className="w-3 h-3" />}
+            {rewriting ? 'Rewriting…' : 'Rewrite Safely'}
+          </button>
+
+          {rewriteError && (
+            <p className="text-xs text-rose-600">{rewriteError}</p>
+          )}
+
+          {rewrite && !rewriting && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3">
+              <p className="text-xs font-semibold text-emerald-600 mb-1">Safe Rewrite</p>
+              <p className="text-sm text-slate-700 leading-relaxed">{rewrite}</p>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
+
+// ── Main component ──────────────────────────────────────────────────────────
 
 export default function AnalyzeDocument({ activeDocument }: Props) {
   const [loading, setLoading] = useState(false);
@@ -55,10 +124,7 @@ export default function AnalyzeDocument({ activeDocument }: Props) {
   const [showAll, setShowAll] = useState(false);
 
   async function handleAnalyze() {
-    if (!activeDocument) {
-      setError('Please upload a document first.');
-      return;
-    }
+    if (!activeDocument) { setError('Please upload a document first.'); return; }
     setLoading(true);
     setError('');
     setResult(null);
@@ -71,13 +137,13 @@ export default function AnalyzeDocument({ activeDocument }: Props) {
     }
   }
 
-  const displayChunks = result
-    ? (showAll ? result.all_chunks : result.unsafe_chunks)
-    : [];
+  const displayChunks = result ? (showAll ? result.all_chunks : result.unsafe_chunks) : [];
+  const highCount   = result?.all_chunks.filter(c => c.severity === 'HIGH').length ?? 0;
+  const mediumCount = result?.all_chunks.filter(c => c.severity === 'MEDIUM').length ?? 0;
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           {activeDocument
             ? <p className="text-sm text-slate-500">Document: <span className="font-medium text-slate-700">{activeDocument}</span></p>
@@ -104,22 +170,31 @@ export default function AnalyzeDocument({ activeDocument }: Props) {
 
       {result && !loading && (
         <div className="space-y-4">
-          {/* Summary bar */}
-          <div className="grid grid-cols-3 gap-3">
+          {/* Summary grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div className="bg-slate-50 rounded-xl p-3 text-center">
               <p className="text-2xl font-bold text-slate-700">{result.total_chunks}</p>
-              <p className="text-xs text-slate-500">Total Chunks</p>
+              <p className="text-xs text-slate-500">Total</p>
             </div>
-            <div className={`rounded-xl p-3 text-center ${result.flagged_chunks > 0 ? 'bg-rose-50' : 'bg-emerald-50'}`}>
-              <p className={`text-2xl font-bold ${result.flagged_chunks > 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                {result.flagged_chunks}
-              </p>
-              <p className={`text-xs ${result.flagged_chunks > 0 ? 'text-rose-500' : 'text-emerald-500'}`}>Flagged</p>
+            <div className="bg-rose-50 rounded-xl p-3 text-center">
+              <p className="text-2xl font-bold text-rose-600">{highCount}</p>
+              <p className="text-xs text-rose-500">High Risk</p>
+            </div>
+            <div className="bg-orange-50 rounded-xl p-3 text-center">
+              <p className="text-2xl font-bold text-orange-600">{mediumCount}</p>
+              <p className="text-xs text-orange-500">Medium Risk</p>
             </div>
             <div className="bg-emerald-50 rounded-xl p-3 text-center">
               <p className="text-2xl font-bold text-emerald-600">{result.total_chunks - result.flagged_chunks}</p>
               <p className="text-xs text-emerald-500">Safe</p>
             </div>
+          </div>
+
+          {/* Colour legend */}
+          <div className="flex flex-wrap gap-3 text-xs">
+            <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-red-400 inline-block" />Red = Toxic</span>
+            <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-orange-400 inline-block" />Orange = Manipulative</span>
+            <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-yellow-400 inline-block" />Yellow = Biased</span>
           </div>
 
           {/* Toggle */}
@@ -146,8 +221,8 @@ export default function AnalyzeDocument({ activeDocument }: Props) {
           )}
 
           <div className="space-y-3">
-            {displayChunks.map((chunk, i) => (
-              <ChunkCard key={chunk.chunk_index} chunk={chunk} index={i} />
+            {displayChunks.map(chunk => (
+              <ChunkCard key={chunk.chunk_index} chunk={chunk} />
             ))}
           </div>
         </div>

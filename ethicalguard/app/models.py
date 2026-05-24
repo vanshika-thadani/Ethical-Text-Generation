@@ -154,6 +154,8 @@ class ChunkAnalysis(BaseModel):
     ethics_score: float
     # Flag: True if any metric is below the safe threshold
     flagged: bool
+    # Severity label based on combined ethical risk: LOW / MEDIUM / HIGH
+    severity: str = "LOW"
 
 
 class AnalyzeDocumentRequest(BaseModel):

@@ -33,11 +33,14 @@ from app import scoring
 from app.config import (
     GEN_MODEL_NAME,
     GEN_MODEL_FALLBACK,
+    GEN_MODEL_FALLBACK2,
     TOXICITY_MODEL,
     SENTIMENT_MODEL,
     BIAS_MODEL,
     EMPTY_OUTPUT_FALLBACK,
     INSTRUCTION_PROMPT_TEMPLATE,
+    REWRITE_PROMPT_TEMPLATE,
+    REWRITE_OUTPUT_STRIP_PREFIXES,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,14 +66,14 @@ def load_models() -> str:
     """
     global gen_tokenizer, gen_model, _model_name_loaded
 
-    # ---- 1. Generation model (TinyLlama → distilgpt2 fallback) ----
-    for model_id in [GEN_MODEL_NAME, GEN_MODEL_FALLBACK]:
+    # ---- 1. Generation model (phi-2 → TinyLlama → distilgpt2 fallback chain) ----
+    for model_id in [GEN_MODEL_NAME, GEN_MODEL_FALLBACK, GEN_MODEL_FALLBACK2]:
         try:
             logger.info(f"Loading generation model: {model_id} ...")
             gen_tokenizer = AutoTokenizer.from_pretrained(model_id)
             gen_model = AutoModelForCausalLM.from_pretrained(model_id)
 
-            # Some tokenizers (e.g. TinyLlama) don't set a pad token by default.
+            # Some tokenizers don't set a pad token by default.
             # We use eos_token as pad so batched generation doesn't crash.
             if gen_tokenizer.pad_token is None:
                 gen_tokenizer.pad_token = gen_tokenizer.eos_token
@@ -80,10 +83,10 @@ def load_models() -> str:
             break
         except Exception as exc:
             logger.warning(f"Failed to load {model_id}: {exc}")
-            if model_id == GEN_MODEL_FALLBACK:
+            if model_id == GEN_MODEL_FALLBACK2:
                 raise RuntimeError(
                     f"Could not load any generation model. "
-                    f"Tried: {GEN_MODEL_NAME}, {GEN_MODEL_FALLBACK}. "
+                    f"Tried: {GEN_MODEL_NAME}, {GEN_MODEL_FALLBACK}, {GEN_MODEL_FALLBACK2}. "
                     f"Last error: {exc}"
                 )
 
@@ -236,3 +239,123 @@ def generate_candidates(prompt: str, num_candidates: int, max_tokens: int) -> li
         results.append(EMPTY_OUTPUT_FALLBACK)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Rewrite-specific generation (used ONLY by /rewrite endpoint)
+# ---------------------------------------------------------------------------
+
+def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens: int) -> list[str]:
+    """
+    Generate rewrite candidates using the dedicated few-shot REWRITE_PROMPT_TEMPLATE.
+
+    This function is intentionally separate from generate_candidates() so that
+    /rewrite uses its own focused prompt while /ask and /generate use theirs.
+
+    The few-shot prompt teaches the model to:
+      - preserve the original meaning
+      - remove manipulation, threats, and toxic language
+      - return ONLY the rewritten sentence (no explanations)
+
+    After generation, known output prefixes (e.g. "Assistant:", "Output:") are
+    stripped so the caller receives a clean rewritten sentence.
+    """
+    prompt = REWRITE_PROMPT_TEMPLATE.format(input_text=input_text)
+
+    # For chat-template models (TinyLlama), wrap the full few-shot prompt
+    # as a single user message so the model sees it in the right format.
+    if hasattr(gen_tokenizer, "apply_chat_template") and gen_tokenizer.chat_template:
+        messages = [{"role": "user", "content": prompt}]
+        formatted = gen_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        formatted = prompt
+
+    results: list[str] = []
+    MAX_RETRIES = num_candidates * 3
+
+    for attempt in range(MAX_RETRIES):
+        if len(results) >= num_candidates:
+            break
+
+        inputs = gen_tokenizer(formatted, return_tensors="pt")
+        input_len = len(inputs["input_ids"][0])
+
+        output = gen_model.generate(
+            **inputs,
+            max_length=input_len + max_tokens,
+            do_sample=True,
+            temperature=0.6,        # slightly lower temp for more focused rewrites
+            top_k=40,
+            top_p=0.9,
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
+            pad_token_id=gen_tokenizer.eos_token_id,
+        )
+
+        generated_ids = output[0][input_len:]
+        raw = gen_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        # Strip known prefixes that instruction-tuned models sometimes prepend
+        cleaned = raw
+        for prefix in REWRITE_OUTPUT_STRIP_PREFIXES:
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):].strip()
+
+        # Take only the first line — the model should return one sentence
+        cleaned = cleaned.split("\n")[0].strip()
+
+        if cleaned:
+            results.append(cleaned)
+        else:
+            logger.warning(f"generate_rewrite_candidates: empty output on attempt {attempt + 1}")
+
+    # Pad with fallback if needed
+    while len(results) < num_candidates:
+        results.append(EMPTY_OUTPUT_FALLBACK)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Browser-extension preparation helpers
+# ---------------------------------------------------------------------------
+# These functions are designed to be called by a future browser extension
+# that sends webpage text to the backend for analysis and rewriting.
+# They are thin wrappers that keep the extension integration surface minimal.
+
+def analyze_webpage_text(text: str) -> list[str]:
+    """
+    Prepare webpage text for ethical analysis.
+
+    Splits the text into sentence-level chunks suitable for scoring.
+    Returns a list of non-empty text segments.
+
+    Future browser extension usage:
+      extension sends full page text → this function chunks it →
+      each chunk is scored by scoring.score_candidate()
+    """
+    from app.utils import chunk_text, clean_text
+    cleaned = clean_text(text)
+    # Use smaller chunks for webpage text (sentences, not paragraphs)
+    return chunk_text(cleaned, chunk_size=80, overlap=10)
+
+
+def rewrite_webpage_chunk(chunk: str, max_tokens: int = 80) -> str:
+    """
+    Rewrite a single webpage text chunk into a safer version.
+
+    Returns the best rewrite candidate (highest final_score).
+
+    Future browser extension usage:
+      user clicks "Rewrite" on a highlighted webpage section →
+      extension sends the chunk here → returns the safe version
+    """
+    from app import scoring
+    from app.config import DEFAULT_ALPHA
+
+    candidates = generate_rewrite_candidates(chunk, num_candidates=3, max_tokens=max_tokens)
+    scored = [scoring.score_candidate(chunk, c, DEFAULT_ALPHA) for c in candidates]
+    best = max(scored, key=lambda s: s.final_score)
+    return best.text

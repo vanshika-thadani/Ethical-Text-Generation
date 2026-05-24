@@ -50,6 +50,7 @@ export interface ChunkAnalysis {
   manipulation_penalty: number;
   ethics_score: number;
   flagged: boolean;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
 }
 
 export interface AnalyzeDocumentResponse {

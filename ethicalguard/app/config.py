@@ -12,19 +12,19 @@ import os
 # ---------------------------------------------------------------------------
 # Generation model
 # ---------------------------------------------------------------------------
-# Default is distilgpt2 for lightweight local CPU development and testing.
-# distilgpt2 is a 117M parameter model that loads quickly and runs on CPU
-# without requiring significant RAM or a GPU.
+# Primary model: microsoft/phi-2 — a 2.7B instruction-tuned model that
+# produces high-quality rewrites and analysis on CPU/GPU.
 #
-# To switch to TinyLlama on a more capable machine (GPU / Colab / Kaggle),
-# set the environment variable before starting the server:
-#   export GEN_MODEL_NAME="TinyLlama/TinyLlama-1.1B-Chat-v1.0"   # Linux/macOS
-#   set GEN_MODEL_NAME=TinyLlama/TinyLlama-1.1B-Chat-v1.0         # Windows
+# Fallback chain: phi-2 → TinyLlama → distilgpt2
+# Each fallback is tried automatically if the previous one fails to load.
 #
-# Falls back to distilgpt2 if the primary model fails to load.
+# Override via environment variable:
+#   set GEN_MODEL_NAME=microsoft/phi-2                          # Windows
+#   export GEN_MODEL_NAME=microsoft/phi-2                       # Linux/macOS
 
-GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "distilgpt2")
-GEN_MODEL_FALLBACK: str = "distilgpt2"
+GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "microsoft/phi-2")
+GEN_MODEL_FALLBACK: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+GEN_MODEL_FALLBACK2: str = "distilgpt2"   # last-resort fallback for CPU-only machines
 
 # ---------------------------------------------------------------------------
 # Safety / scoring models (HuggingFace model IDs)
@@ -87,13 +87,50 @@ DEFAULT_ALPHA: float = 0.7
 # Scoring (coherence, toxicity, etc.) always compares against the original
 # user prompt so results remain meaningful and unbiased by the wrapper.
 INSTRUCTION_PROMPT_TEMPLATE: str = (
-    "You are EthicalGuard, a safe and respectful communication coach. "
-    "Respond in a calm, non-manipulative, emotionally healthy way. "
-    "If the user asks for guilt, revenge, manipulation, or harmful persuasion, "
-    "redirect them toward honest and respectful communication.\n"
+    "You are EthicalGuard, an AI content moderation and safety analysis system. "
+    "Analyze the following content and respond in a factual, neutral, and informative way. "
+    "Focus on identifying ethical issues, biases, or unsafe patterns if present.\n"
     "User: {prompt}\n"
     "Assistant:"
 )
+
+# ---------------------------------------------------------------------------
+# Rewrite-specific few-shot prompt (used ONLY by /rewrite endpoint)
+# ---------------------------------------------------------------------------
+# This prompt is NOT used for /ask or /generate.
+# It uses few-shot examples to teach the model to preserve meaning while
+# removing manipulation, toxicity, and emotional aggression.
+# The {input_text} placeholder is replaced with the user's actual text.
+REWRITE_PROMPT_TEMPLATE: str = (
+    "You are an ethical AI rewriting assistant.\n"
+    "Your task is to rewrite harmful, manipulative, toxic, biased, or emotionally "
+    "aggressive sentences into safer and more respectful versions while preserving "
+    "the original intent.\n\n"
+    "Rules:\n"
+    "- Preserve the original meaning\n"
+    "- Remove threats, manipulation, toxicity, and emotional pressure\n"
+    "- Keep the rewrite concise\n"
+    "- Use calm and respectful language\n"
+    "- Do not add explanations\n"
+    "- Return ONLY the rewritten sentence\n\n"
+    "Examples:\n"
+    'Input: "You must listen to me or you will regret it."\n'
+    'Output: "Please listen to my concerns so we can discuss this respectfully."\n\n'
+    'Input: "People like them are always causing problems."\n'
+    'Output: "I think there are concerns about certain behaviors that should be discussed fairly."\n\n'
+    'Input: "This is the only way. Trust me blindly."\n'
+    'Output: "This approach may help, but it\'s important to evaluate different options carefully."\n\n'
+    "Now rewrite the following sentence safely:\n"
+    'Input: "{input_text}"\n'
+    "Output:"
+)
+
+# Prefixes that instruction-tuned models sometimes prepend to their output.
+# These are stripped from rewrite results so only the clean sentence is returned.
+REWRITE_OUTPUT_STRIP_PREFIXES: list = [
+    "EthicalCoach:", "Assistant:", "Output:", "Rewrite:", "Answer:",
+    "EthicalGuard:", "Safe version:", "Safer version:",
+]
 # distilgpt2 occasionally generates zero new tokens (e.g. when the prompt
 # fills the max_length budget or sampling collapses to eos immediately).
 # This neutral, safe sentence is substituted whenever that happens so the

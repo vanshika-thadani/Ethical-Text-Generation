@@ -463,6 +463,17 @@ def analyze_document(req: AnalyzeDocumentRequest):
         # Flag the chunk if its ethics score is below the safety threshold
         flagged = scores.ethics_score < CHUNK_ANALYSIS_FLAG_THRESHOLD
 
+        # Severity label based on combined risk score:
+        #   HIGH   → ethics < 0.4  (strongly unsafe)
+        #   MEDIUM → ethics < 0.6  (moderately unsafe)
+        #   LOW    → ethics >= 0.6 (safe)
+        if scores.ethics_score < 0.4:
+            severity = "HIGH"
+        elif scores.ethics_score < CHUNK_ANALYSIS_FLAG_THRESHOLD:
+            severity = "MEDIUM"
+        else:
+            severity = "LOW"
+
         chunk_analyses.append(ChunkAnalysis(
             chunk=chunk_text,
             chunk_index=chunk_index,
@@ -471,6 +482,7 @@ def analyze_document(req: AnalyzeDocumentRequest):
             manipulation_penalty=scores.manipulation_penalty,
             ethics_score=scores.ethics_score,
             flagged=flagged,
+            severity=severity,
         ))
 
     unsafe = [c for c in chunk_analyses if c.flagged]
@@ -516,9 +528,13 @@ def rewrite(req: RewriteRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scoring original text failed: {exc}")
 
-    # Generate ethical rewrites
+    # Generate ethical rewrites using the dedicated few-shot rewrite prompt.
+    # This is intentionally different from /generate and /ask which use
+    # INSTRUCTION_PROMPT_TEMPLATE — keeping prompts separate per module.
     try:
-        candidates_text = generation.generate_candidates(req.text, req.beams, req.max_tokens)
+        candidates_text = generation.generate_rewrite_candidates(
+            req.text, req.beams, req.max_tokens
+        )
         scored: List[CandidateScores] = [
             scoring.score_candidate(req.text, text, req.alpha)
             for text in candidates_text
