@@ -26,3 +26,7 @@ Thumbs.db
 
 # HuggingFace model cache (large, downloaded automatically)
 .cache/
+
+# Frontend build output and dependencies
+ethicalguard-ui/node_modules/
+ethicalguard-ui/dist/
