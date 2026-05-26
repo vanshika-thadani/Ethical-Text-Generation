@@ -535,14 +535,24 @@ def rewrite(req: RewriteRequest):
         candidates_text = generation.generate_rewrite_candidates(
             req.text, req.beams, req.max_tokens
         )
+    except ValueError as exc:
+        # No valid candidate was produced after all retries.
+        # Return a readable 422 instead of a 500 or junk output.
+        logger.warning(f"/rewrite — no valid candidates: {exc}")
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"/rewrite — generation failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Rewrite generation failed: {exc}")
+
+    try:
         scored: List[CandidateScores] = [
             scoring.score_candidate(req.text, text, req.alpha)
             for text in candidates_text
         ]
         best = max(scored, key=lambda c: c.final_score)
     except Exception as exc:
-        logger.error(f"/rewrite — generation failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"Rewrite generation failed: {exc}")
+        logger.error(f"/rewrite — scoring failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Rewrite scoring failed: {exc}")
 
     return RewriteResponse(
         original=req.text,

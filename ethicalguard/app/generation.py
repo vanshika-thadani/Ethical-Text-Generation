@@ -21,6 +21,7 @@ automatically fall back to distilgpt2 so the server always starts.
 """
 
 import logging
+import re
 import torch
 from app.config import EMPTY_OUTPUT_FALLBACK
 from transformers import (
@@ -58,6 +59,57 @@ if torch.cuda.is_available():
     logger.info(f"CUDA available — device: {torch.cuda.get_device_name(0)}")
 else:
     logger.info("CUDA not available — running on CPU")
+
+
+# ---------------------------------------------------------------------------
+# Rewrite candidate validation
+# ---------------------------------------------------------------------------
+
+# Prompt fragments that leak into output when the model echoes the prompt
+# instead of generating a rewrite.
+_REWRITE_LEAK_PHRASES = [
+    "input:", "output:", "assistant:", "you are an ethical ai",
+    "rules:", "examples:", "now rewrite", "rewrite the following",
+]
+
+
+def is_valid_rewrite_candidate(text: str) -> bool:
+    """
+    Return True only if `text` looks like a genuine rewritten sentence.
+
+    Rejects:
+      - Empty or whitespace-only strings
+      - Strings shorter than 8 characters (too short to be a sentence)
+      - Strings with no alphabetic characters (pure punctuation / symbols)
+      - Known junk tokens: "_", "__", "...", ".", "-", "--"
+      - Prompt fragments leaking into the output (model echoed the prompt)
+
+    Does NOT reject valid rewrites that happen to be short — the 8-char
+    minimum is intentionally low to allow short but meaningful sentences.
+    """
+    if not text:
+        return False
+
+    stripped = text.strip()
+
+    # Too short to be a real sentence
+    if len(stripped) < 8:
+        return False
+
+    # No letters at all — pure symbols / punctuation
+    if not re.search(r"[a-zA-Z]", stripped):
+        return False
+
+    # Known junk tokens
+    if stripped in {"_", "__", "...", ".", "-", "--", "___"}:
+        return False
+
+    # Model echoed the prompt template instead of generating a rewrite
+    lower = stripped.lower()
+    if any(phrase in lower for phrase in _REWRITE_LEAK_PHRASES):
+        return False
+
+    return True
 
 # ---------------------------------------------------------------------------
 # Module-level handles (set during load_models())
@@ -283,16 +335,20 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
     """
     Generate rewrite candidates using the dedicated few-shot REWRITE_PROMPT_TEMPLATE.
 
-    This function is intentionally separate from generate_candidates() so that
-    /rewrite uses its own focused prompt while /ask and /generate use theirs.
+    Only candidates that pass is_valid_rewrite_candidate() are kept.
+    Invalid outputs (junk tokens, prompt echoes, pure punctuation) are logged
+    and discarded — never returned to the caller.
 
-    The few-shot prompt teaches the model to:
-      - preserve the original meaning
-      - remove manipulation, threats, and toxic language
-      - return ONLY the rewritten sentence (no explanations)
+    Raises ValueError if no valid candidate is produced after MAX_RETRIES,
+    so the endpoint can return a readable HTTP error instead of junk.
 
-    After generation, known output prefixes (e.g. "Assistant:", "Output:") are
-    stripped so the caller receives a clean rewritten sentence.
+    Post-processing pipeline per raw output:
+      1. Strip known output prefixes ("Assistant:", "Output:", etc.)
+      2. Remove surrounding quotes
+      3. Remove markdown bullet characters
+      4. Take the first non-empty line (model should return one sentence)
+      5. Strip whitespace
+      6. Validate with is_valid_rewrite_candidate()
     """
     prompt = REWRITE_PROMPT_TEMPLATE.format(input_text=input_text)
 
@@ -307,14 +363,13 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
         formatted = prompt
 
     results: list[str] = []
-    MAX_RETRIES = num_candidates * 3
+    MAX_RETRIES = num_candidates * 5   # more retries since we're stricter now
 
     for attempt in range(MAX_RETRIES):
         if len(results) >= num_candidates:
             break
 
         inputs = gen_tokenizer(formatted, return_tensors="pt")
-        # Move inputs to model device (GPU or CPU)
         inputs = {k: v.to(gen_model.device) for k, v in inputs.items()}
         input_len = len(inputs["input_ids"][0])
 
@@ -322,7 +377,7 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
             **inputs,
             max_length=input_len + max_tokens,
             do_sample=True,
-            temperature=0.6,        # slightly lower temp for more focused rewrites
+            temperature=0.6,
             top_k=40,
             top_p=0.9,
             repetition_penalty=1.3,
@@ -332,24 +387,48 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
 
         generated_ids = output[0][input_len:]
         raw = gen_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        logger.debug(f"Rewrite attempt {attempt + 1} raw output: {repr(raw)}")
 
-        # Strip known prefixes that instruction-tuned models sometimes prepend
+        # ── Post-processing ──────────────────────────────────────────────
+
         cleaned = raw
+
+        # 1. Strip known output prefixes
         for prefix in REWRITE_OUTPUT_STRIP_PREFIXES:
             if cleaned.lower().startswith(prefix.lower()):
                 cleaned = cleaned[len(prefix):].strip()
 
-        # Take only the first line — the model should return one sentence
-        cleaned = cleaned.split("\n")[0].strip()
+        # 2. Remove surrounding quotes (single or double)
+        cleaned = cleaned.strip('"\'')
 
-        if cleaned:
+        # 3. Remove markdown bullet characters at the start
+        cleaned = re.sub(r"^[\-\*\•]\s*", "", cleaned)
+
+        # 4. Take the first non-empty line
+        lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+        cleaned = lines[0] if lines else ""
+
+        # 5. Final whitespace strip
+        cleaned = cleaned.strip()
+
+        logger.debug(f"Rewrite attempt {attempt + 1} cleaned: {repr(cleaned)}")
+
+        # 6. Validate
+        if is_valid_rewrite_candidate(cleaned):
             results.append(cleaned)
         else:
-            logger.warning(f"generate_rewrite_candidates: empty output on attempt {attempt + 1}")
+            logger.warning(
+                f"Rejected invalid rewrite candidate (attempt {attempt + 1}): {repr(cleaned)}"
+            )
 
-    # Pad with fallback if needed
-    while len(results) < num_candidates:
-        results.append(EMPTY_OUTPUT_FALLBACK)
+    if not results:
+        # No valid candidate after all retries — raise so the endpoint can
+        # return a readable HTTP 500 instead of junk or NaN.
+        raise ValueError(
+            "Could not generate a valid rewrite. "
+            "The model produced only invalid outputs after multiple attempts. "
+            "Please try again."
+        )
 
     return results
 

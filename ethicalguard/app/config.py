@@ -112,7 +112,9 @@ REWRITE_PROMPT_TEMPLATE: str = (
     "- Keep the rewrite concise\n"
     "- Use calm and respectful language\n"
     "- Do not add explanations\n"
-    "- Return ONLY the rewritten sentence\n\n"
+    "- Return ONLY the rewritten sentence\n"
+    "- Return a complete sentence with proper grammar\n"
+    "- Never return symbols, punctuation-only text, or blank output\n\n"
     "Examples:\n"
     'Input: "You must listen to me or you will regret it."\n'
     'Output: "Please listen to my concerns so we can discuss this respectfully."\n\n'

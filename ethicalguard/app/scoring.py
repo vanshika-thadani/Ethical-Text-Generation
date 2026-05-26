@@ -313,6 +313,12 @@ def _fluency_score(text: str) -> float:
         _logger.warning(f"_fluency_score: loss is {'NaN' if math.isnan(loss) else 'Inf'} → returning 0.0")
         return 0.0
 
+    # Guard: unusually high loss (> 20) indicates near-random text.
+    # exp(20) ≈ 485M perplexity — effectively meaningless, return low score.
+    if loss > 20:
+        _logger.warning(f"_fluency_score: unusually high loss={loss:.2f} → returning 0.1")
+        return 0.1
+
     perplexity = math.exp(min(loss, 100.0))   # cap before exp to avoid overflow
     score = 1.0 / (1.0 + math.log(max(perplexity, 1.0)))
     return safe_float(score, default=0.0, label="fluency_score")
