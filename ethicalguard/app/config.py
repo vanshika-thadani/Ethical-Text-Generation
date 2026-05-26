@@ -107,12 +107,13 @@ REWRITE_PROMPT_TEMPLATE: str = (
     "aggressive sentences into safer and more respectful versions while preserving "
     "the original intent.\n\n"
     "Rules:\n"
-    "- Preserve the original meaning\n"
+    "- Preserve the main point of the original sentence\n"
     "- Remove threats, manipulation, toxicity, and emotional pressure\n"
     "- Keep the rewrite concise\n"
     "- Use calm and respectful language\n"
-    "- Do not add explanations\n"
-    "- Return ONLY the rewritten sentence\n"
+    "- Do not add extra politeness phrases like 'Thank you for sharing'\n"
+    "- Do not add explanations or commentary\n"
+    "- Rewrite in one direct sentence\n"
     "- Return a complete sentence with proper grammar\n"
     "- Never return symbols, punctuation-only text, or blank output\n\n"
     "Examples:\n"
@@ -122,6 +123,8 @@ REWRITE_PROMPT_TEMPLATE: str = (
     'Output: "I think there are concerns about certain behaviors that should be discussed fairly."\n\n'
     'Input: "This is the only way. Trust me blindly."\n'
     'Output: "This approach may help, but it\'s important to evaluate different options carefully."\n\n'
+    'Input: "Everyone else agrees with me. You are the only problem here."\n'
+    'Output: "Several people may see this differently, so let\'s discuss the issue without blaming anyone."\n\n'
     "Now rewrite the following sentence safely:\n"
     'Input: "{input_text}"\n'
     "Output:"
