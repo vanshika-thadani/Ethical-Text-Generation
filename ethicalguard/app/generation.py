@@ -65,53 +65,76 @@ else:
 # Rewrite candidate validation
 # ---------------------------------------------------------------------------
 
-# Prompt fragments that leak into output when the model echoes the prompt
-# instead of generating a rewrite, or narrates instead of rewrites.
-_REWRITE_LEAK_PHRASES = [
-    "input:", "output:", "assistant:", "you are an ethical ai",
-    "rules:", "examples:", "now rewrite", "rewrite the following",
-    # Meta-commentary: model describes what it will do instead of doing it
-    "the rewritten version", "here is a safer", "here is a rewritten",
-    "a safer version", "a rewritten version", "could look something like",
-    "could be rewritten as", "here's a rewrite", "here is the rewrite",
-    "the rewrite would be", "one way to rewrite",
-]
-
-
 def is_valid_rewrite_candidate(text: str) -> bool:
     """
-    Return True only if `text` looks like a genuine rewritten sentence.
+    Structurally validate a rewrite candidate without hardcoding specific phrases.
 
-    Rejects:
-      - Empty or whitespace-only strings
-      - Strings shorter than 8 characters (too short to be a sentence)
-      - Strings with no alphabetic characters (pure punctuation / symbols)
-      - Known junk tokens: "_", "__", "...", ".", "-", "--"
-      - Prompt fragments leaking into the output (model echoed the prompt)
+    The checks are based on what a genuine rewritten sentence looks like,
+    not on a blocklist of known bad strings (which is always incomplete).
 
-    Does NOT reject valid rewrites that happen to be short — the 8-char
-    minimum is intentionally low to allow short but meaningful sentences.
+    Rejects if ANY of these structural signals are present:
+
+    1. Too short — fewer than 8 characters can't be a real sentence.
+
+    2. No alphabetic characters — pure punctuation/symbols.
+
+    3. Ends with a colon — "Output:", "Rewritten:", "In English:", etc.
+       A real sentence never ends with a colon.
+
+    4. Starts with a known meta-prefix pattern — catches "Output:", "Input:",
+       "Assistant:", "Rewritten:", "Here is", "Here's", "A safer", etc.
+       Detected by regex so it generalises to any variant, not a fixed list.
+
+    5. Ratio of alphabetic characters to total characters is below 40% —
+       catches outputs that are mostly punctuation, underscores, or symbols
+       even if they contain a few letters.
+
+    6. Word count is 1 — a single word is never a valid rewrite.
     """
     if not text:
         return False
 
     stripped = text.strip()
 
-    # Too short to be a real sentence
+    # 1. Too short
     if len(stripped) < 8:
         return False
 
-    # No letters at all — pure symbols / punctuation
+    # 2. No letters
     if not re.search(r"[a-zA-Z]", stripped):
         return False
 
-    # Known junk tokens
-    if stripped in {"_", "__", "...", ".", "-", "--", "___"}:
+    # 3. Ends with a colon — structural sign of a label/header, not a sentence
+    if stripped.endswith(":"):
         return False
 
-    # Model echoed the prompt template instead of generating a rewrite
-    lower = stripped.lower()
-    if any(phrase in lower for phrase in _REWRITE_LEAK_PHRASES):
+    # 4. Starts with a meta-prefix pattern.
+    #    Matches things like:
+    #      "Output:", "Input:", "Assistant:", "Rewritten:", "Rewrite:",
+    #      "Here is", "Here's", "A safer", "A rewritten", "The rewritten",
+    #      "One way to", "This could be", "You could say"
+    #    The pattern is: optional article/determiner + descriptive noun/verb phrase
+    #    followed by a colon OR a verb like "is/would/could/can".
+    meta_prefix = re.compile(
+        r"^("
+        r"(output|input|assistant|rewritten?|safer version|example)\s*:"  # label: value
+        r"|here\s+(is|are|'s)\b"          # "Here is", "Here are", "Here's"
+        r"|(a|the|one)\s+\w+\s+(version|way|rewrite|sentence|example)\b"  # "A safer version"
+        r"|this\s+(could|would|can|is)\b"  # "This could be"
+        r"|you\s+could\s+say\b"            # "You could say"
+        r")",
+        re.IGNORECASE,
+    )
+    if meta_prefix.match(stripped):
+        return False
+
+    # 5. Low alpha ratio — mostly symbols/punctuation
+    alpha_count = sum(1 for c in stripped if c.isalpha())
+    if len(stripped) > 0 and alpha_count / len(stripped) < 0.40:
+        return False
+
+    # 6. Single word — not a sentence
+    if len(stripped.split()) < 2:
         return False
 
     return True
@@ -403,8 +426,15 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
             if cleaned.lower().startswith(prefix.lower()):
                 cleaned = cleaned[len(prefix):].strip()
 
-        # 2. Remove surrounding quotes (single or double)
-        cleaned = cleaned.strip('"\'')
+        # 1b. Strip "Output (in English):" style prefixes produced by
+        #     multilingual models that annotate the language of their output
+        cleaned = re.sub(r"(?i)^output\s*\([^)]*\)\s*:\s*", "", cleaned).strip()
+
+        # 2. Remove surrounding quotes (single or double, including escaped)
+        cleaned = cleaned.strip('"\'').strip()
+        # Also remove escaped quotes that some models emit: \"text\"
+        if cleaned.startswith('\\"') and cleaned.endswith('\\"'):
+            cleaned = cleaned[2:-2].strip()
 
         # 3. Remove markdown bullet characters at the start
         cleaned = re.sub(r"^[\-\*\•]\s*", "", cleaned)

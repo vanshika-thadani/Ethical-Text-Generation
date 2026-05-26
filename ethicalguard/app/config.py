@@ -102,34 +102,37 @@ INSTRUCTION_PROMPT_TEMPLATE: str = (
 # removing manipulation, toxicity, and emotional aggression.
 # The {input_text} placeholder is replaced with the user's actual text.
 REWRITE_PROMPT_TEMPLATE: str = (
-    "You are an ethical AI rewriting assistant.\n"
-    "Your task is to rewrite harmful, manipulative, toxic, biased, or emotionally "
-    "aggressive sentences into safer and more respectful versions while preserving "
-    "the original intent.\n\n"
-    "Rules:\n"
-    "- Preserve the main point of the original sentence\n"
-    "- Remove threats, manipulation, toxicity, and emotional pressure\n"
-    "- Keep the rewrite concise\n"
-    "- Use calm and respectful language\n"
-    "- Do not add extra politeness phrases like 'Thank you for sharing'\n"
-    "- Do not add explanations or commentary\n"
-    "- Do not describe what you are doing — just write the rewritten sentence directly\n"
-    "- Do not say 'The rewritten version' or 'Here is a safer version' or similar\n"
-    "- Rewrite in one direct sentence\n"
-    "- Return a complete sentence with proper grammar\n"
-    "- Never return symbols, punctuation-only text, or blank output\n\n"
+    "You are an ethical AI rewriting assistant.\n\n"
+    "Task: Rewrite the input sentence to remove personal attacks, threats, manipulation, "
+    "or toxic language — while keeping the speaker's core complaint, concern, or feeling intact.\n\n"
+    "Transformation principle:\n"
+    "  Keep: the underlying emotion, concern, or complaint\n"
+    "  Remove: blame directed at a specific person, threats, manipulation, insults\n"
+    "  Replace: 'you ruined this' → 'this situation did not go well'\n"
+    "  Replace: 'you never care' → 'I feel uncared for in this situation'\n"
+    "  Replace: 'you will regret this' → 'I hope we can resolve this'\n\n"
+    "Output rules:\n"
+    "- Write exactly one complete sentence\n"
+    "- Use first-person ('I feel...', 'I think...', 'I hope...') when expressing emotion\n"
+    "- Do not add phrases like 'Thank you', 'I appreciate', or 'I understand'\n"
+    "- Do not describe what you are doing — output the rewritten sentence only\n"
+    "- Do not include labels like 'Output:', 'Rewritten:', or 'In English:'\n"
+    "- Do not wrap the output in quotes\n"
+    "- Never output placeholder text like 'Rewritten Sentence'\n\n"
     "Examples:\n"
     'Input: "You must listen to me or you will regret it."\n'
-    'Output: "Please listen to my concerns so we can discuss this respectfully."\n\n'
-    'Input: "People like them are always causing problems."\n'
-    'Output: "I think there are concerns about certain behaviors that should be discussed fairly."\n\n'
-    'Input: "This is the only way. Trust me blindly."\n'
-    'Output: "This approach may help, but it\'s important to evaluate different options carefully."\n\n'
+    'Output: I hope you will consider what I am saying so we can resolve this together.\n\n'
+    'Input: "People like you always ruin everything."\n'
+    'Output: I feel frustrated because this situation did not turn out well.\n\n'
     'Input: "Everyone else agrees with me. You are the only problem here."\n'
-    'Output: "Several people may see this differently, so let\'s discuss the issue without blaming anyone."\n\n'
-    'Input: "You should trust me blindly because I know better than you."\n'
-    'Output: "I have some experience here, but I encourage you to consider different perspectives before deciding."\n\n'
-    "Now rewrite the following sentence safely:\n"
+    'Output: Several people see this differently, so I think we should discuss it without placing blame.\n\n'
+    'Input: "After all I did for you, this is how you treat me?"\n'
+    'Output: I feel hurt because I expected more consideration after everything I contributed.\n\n'
+    'Input: "If you leave me, I will never recover."\n'
+    'Output: I am worried about what will happen to our relationship if we cannot work this out.\n\n'
+    'Input: "This is the only way. Trust me blindly."\n'
+    'Output: I believe this approach could work, though I encourage you to weigh the options yourself.\n\n'
+    "Now rewrite the following:\n"
     'Input: "{input_text}"\n'
     "Output:"
 )
