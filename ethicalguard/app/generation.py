@@ -21,6 +21,7 @@ automatically fall back to distilgpt2 so the server always starts.
 """
 
 import logging
+import torch
 from app.config import EMPTY_OUTPUT_FALLBACK
 from transformers import (
     AutoTokenizer,
@@ -46,6 +47,19 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Device selection — use GPU if available, fall back to CPU
+# ---------------------------------------------------------------------------
+# Detected once at module load so every function can reference it.
+# On Colab with a T4/A100, this will be "cuda"; on a local CPU machine, "cpu".
+
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+if torch.cuda.is_available():
+    logger.info(f"CUDA available — device: {torch.cuda.get_device_name(0)}")
+else:
+    logger.info("CUDA not available — running on CPU")
+
+# ---------------------------------------------------------------------------
 # Module-level handles (set during load_models())
 # ---------------------------------------------------------------------------
 gen_tokenizer = None
@@ -69,9 +83,23 @@ def load_models() -> str:
     # ---- 1. Generation model (phi-2 → TinyLlama → distilgpt2 fallback chain) ----
     for model_id in [GEN_MODEL_NAME, GEN_MODEL_FALLBACK, GEN_MODEL_FALLBACK2]:
         try:
-            logger.info(f"Loading generation model: {model_id} ...")
+            logger.info(f"Loading generation model: {model_id} on {_device} ...")
             gen_tokenizer = AutoTokenizer.from_pretrained(model_id)
-            gen_model = AutoModelForCausalLM.from_pretrained(model_id)
+
+            # Use float16 + device_map on GPU for faster inference and lower VRAM usage.
+            # On CPU, use float32 (float16 is not supported on most CPU backends).
+            # low_cpu_mem_usage=True reduces peak RAM during loading by streaming weights.
+            gen_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if _device == "cuda" else torch.float32,
+                device_map="auto" if _device == "cuda" else None,
+                low_cpu_mem_usage=True,
+            )
+
+            # On CPU, manually move the model to the target device.
+            # On GPU with device_map="auto", the model is already placed correctly.
+            if _device == "cpu":
+                gen_model = gen_model.to(_device)
 
             # Some tokenizers don't set a pad token by default.
             # We use eos_token as pad so batched generation doesn't crash.
@@ -79,7 +107,10 @@ def load_models() -> str:
                 gen_tokenizer.pad_token = gen_tokenizer.eos_token
 
             _model_name_loaded = model_id
-            logger.info(f"Generation model loaded: {model_id}")
+            logger.info(
+                f"Generation model loaded: {model_id} | "
+                f"device: {next(gen_model.parameters()).device}"
+            )
             break
         except Exception as exc:
             logger.warning(f"Failed to load {model_id}: {exc}")
@@ -180,6 +211,9 @@ def generate_one(prompt: str, max_tokens: int) -> str:
         formatted = wrapped
 
     inputs = gen_tokenizer(formatted, return_tensors="pt")
+    # Move tokenized inputs to the same device as the model.
+    # On GPU this sends tensors to CUDA; on CPU this is a no-op.
+    inputs = {k: v.to(gen_model.device) for k, v in inputs.items()}
     input_len = len(inputs["input_ids"][0])
 
     output = gen_model.generate(
@@ -280,6 +314,8 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
             break
 
         inputs = gen_tokenizer(formatted, return_tensors="pt")
+        # Move inputs to model device (GPU or CPU)
+        inputs = {k: v.to(gen_model.device) for k, v in inputs.items()}
         input_len = len(inputs["input_ids"][0])
 
         output = gen_model.generate(

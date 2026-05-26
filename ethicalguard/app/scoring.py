@@ -262,6 +262,11 @@ def _fluency_score(text: str) -> float:
     inputs = _gen_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
     )
+    # Move inputs to the same device as the generation model.
+    # This is required when the model is on GPU — CPU tensors cannot be
+    # passed to a CUDA model.
+    model_device = next(_gen_model.parameters()).device
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = _gen_model(**inputs, labels=inputs["input_ids"])
     loss = outputs.loss.item()
