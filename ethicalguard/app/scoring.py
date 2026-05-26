@@ -45,7 +45,6 @@ from __future__ import annotations
 import math
 import torch
 from sentence_transformers import SentenceTransformer, util
-
 from app.config import (
     WEIGHT_TOXICITY, WEIGHT_SENTIMENT, WEIGHT_BIAS, WEIGHT_COHERENCE,
     MANIPULATION_TRIGGERS, MANIPULATION_PENALTY_PER_WORD, MANIPULATION_PENALTY_MAX,
@@ -83,6 +82,35 @@ _UNSAFE_LABEL_KEYWORDS = {"hate", "toxic", "offensive", "abusive"}
 
 import logging as _logging
 _logger = _logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# NaN / Inf safety helper
+# ---------------------------------------------------------------------------
+
+def safe_float(value: object, default: float = 0.0, label: str = "") -> float:
+    """
+    Convert a raw score to a JSON-safe float.
+
+    Returns `default` (0.0) if the value is:
+      - None
+      - NaN  (can occur when a model returns degenerate logits)
+      - Inf  (can occur from log(0) or division by zero in perplexity)
+
+    Logs a warning whenever a replacement is made so the root cause can be
+    investigated without crashing the API.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        _logger.warning(f"safe_float: could not convert {label!r} value {value!r} → using {default}")
+        return default
+
+    if math.isnan(v) or math.isinf(v):
+        _logger.warning(f"safe_float: {label!r} is {'NaN' if math.isnan(v) else 'Inf'} → replacing with {default}")
+        return default
+
+    return round(v, 4)
 
 
 def _resolve_safe_label_index(model) -> int:
@@ -225,14 +253,22 @@ def _coherence_score(prompt: str, response: str) -> float:
     Range: [0, 1] after clamping (raw cosine can be slightly negative).
     High score = the response is semantically on-topic.
 
-    Why SBERT instead of token overlap?
-      Token overlap (Jaccard / BLEU) misses paraphrases.
-      SBERT maps sentences to a dense semantic space, so "automobile" and
-      "car" will have high similarity even though they share no tokens.
+    Guards:
+      - Empty prompt or response → return 0.0 (no meaningful similarity)
+      - NaN cosine result        → return 0.0 (degenerate embedding)
     """
+    if not prompt or not prompt.strip() or not response or not response.strip():
+        return 0.0
+
     prompt_emb = _sbert_model.encode(prompt, convert_to_tensor=True)
     resp_emb = _sbert_model.encode(response, convert_to_tensor=True)
     sim = float(util.cos_sim(prompt_emb, resp_emb).item())
+
+    # Clamp to [0, 1] and guard against NaN from degenerate embeddings
+    if math.isnan(sim) or math.isinf(sim):
+        _logger.warning(f"_coherence_score: cosine similarity is NaN/Inf → returning 0.0")
+        return 0.0
+
     return round(max(0.0, min(sim, 1.0)), 4)
 
 
@@ -269,10 +305,17 @@ def _fluency_score(text: str) -> float:
     inputs = {k: v.to(model_device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = _gen_model(**inputs, labels=inputs["input_ids"])
+
     loss = outputs.loss.item()
-    perplexity = math.exp(loss)
+
+    # Guard: NaN or Inf loss means the model produced degenerate output
+    if math.isnan(loss) or math.isinf(loss):
+        _logger.warning(f"_fluency_score: loss is {'NaN' if math.isnan(loss) else 'Inf'} → returning 0.0")
+        return 0.0
+
+    perplexity = math.exp(min(loss, 100.0))   # cap before exp to avoid overflow
     score = 1.0 / (1.0 + math.log(max(perplexity, 1.0)))
-    return round(score, 4)
+    return safe_float(score, default=0.0, label="fluency_score")
 
 
 def _manipulation_penalty(text: str) -> float:
@@ -332,24 +375,28 @@ def score_candidate(prompt: str, text: str, alpha: float) -> CandidateScores:
     if not text or not text.strip():
         _logger.warning("score_candidate() received empty text — substituting fallback.")
         text = EMPTY_OUTPUT_FALLBACK
-    tox = _toxicity_score(text)
-    sent = _sentiment_score(text)
-    bias = _bias_score(text)
-    coh = _coherence_score(prompt, text)
-    flu = _fluency_score(text)
-    manip = _manipulation_penalty(text)
+
+    tox   = safe_float(_toxicity_score(text),          label="toxicity_score")
+    sent  = safe_float(_sentiment_score(text),          label="sentiment_score")
+    bias  = safe_float(_bias_score(text),               label="bias_score")
+    coh   = safe_float(_coherence_score(prompt, text),  label="coherence_score")
+    flu   = safe_float(_fluency_score(text),            label="fluency_score")
+    manip = safe_float(_manipulation_penalty(text),     label="manipulation_penalty")
 
     # Ethics composite — weighted average of the four safety dimensions
-    ethics = (
+    ethics = safe_float(
         WEIGHT_TOXICITY * tox
         + WEIGHT_SENTIMENT * sent
         + WEIGHT_BIAS * bias
-        + WEIGHT_COHERENCE * coh
+        + WEIGHT_COHERENCE * coh,
+        label="ethics_score",
     )
-    ethics = round(ethics, 4)
 
     # Final score balances ethics and fluency, then subtracts manipulation
-    final = round(alpha * ethics + (1 - alpha) * flu - manip, 4)
+    final = safe_float(
+        alpha * ethics + (1 - alpha) * flu - manip,
+        label="final_score",
+    )
 
     return CandidateScores(
         text=text,
