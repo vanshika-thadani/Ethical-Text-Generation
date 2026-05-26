@@ -117,7 +117,7 @@ def is_valid_rewrite_candidate(text: str) -> bool:
     #    followed by a colon OR a verb like "is/would/could/can".
     meta_prefix = re.compile(
         r"^("
-        r"(output|input|assistant|rewritten?|safer version|example)\s*:"  # label: value
+        r"(output|input|assistant|rewritten?|safer version|example|sentence)\s*:"  # label: value
         r"|here\s+(is|are|'s)\b"          # "Here is", "Here are", "Here's"
         r"|(a|the|one)\s+\w+\s+(version|way|rewrite|sentence|example)\b"  # "A safer version"
         r"|this\s+(could|would|can|is)\b"  # "This could be"
