@@ -66,10 +66,15 @@ else:
 # ---------------------------------------------------------------------------
 
 # Prompt fragments that leak into output when the model echoes the prompt
-# instead of generating a rewrite.
+# instead of generating a rewrite, or narrates instead of rewrites.
 _REWRITE_LEAK_PHRASES = [
     "input:", "output:", "assistant:", "you are an ethical ai",
     "rules:", "examples:", "now rewrite", "rewrite the following",
+    # Meta-commentary: model describes what it will do instead of doing it
+    "the rewritten version", "here is a safer", "here is a rewritten",
+    "a safer version", "a rewritten version", "could look something like",
+    "could be rewritten as", "here's a rewrite", "here is the rewrite",
+    "the rewrite would be", "one way to rewrite",
 ]
 
 

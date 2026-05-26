@@ -113,6 +113,8 @@ REWRITE_PROMPT_TEMPLATE: str = (
     "- Use calm and respectful language\n"
     "- Do not add extra politeness phrases like 'Thank you for sharing'\n"
     "- Do not add explanations or commentary\n"
+    "- Do not describe what you are doing — just write the rewritten sentence directly\n"
+    "- Do not say 'The rewritten version' or 'Here is a safer version' or similar\n"
     "- Rewrite in one direct sentence\n"
     "- Return a complete sentence with proper grammar\n"
     "- Never return symbols, punctuation-only text, or blank output\n\n"
@@ -125,6 +127,8 @@ REWRITE_PROMPT_TEMPLATE: str = (
     'Output: "This approach may help, but it\'s important to evaluate different options carefully."\n\n'
     'Input: "Everyone else agrees with me. You are the only problem here."\n'
     'Output: "Several people may see this differently, so let\'s discuss the issue without blaming anyone."\n\n'
+    'Input: "You should trust me blindly because I know better than you."\n'
+    'Output: "I have some experience here, but I encourage you to consider different perspectives before deciding."\n\n'
     "Now rewrite the following sentence safely:\n"
     'Input: "{input_text}"\n'
     "Output:"
