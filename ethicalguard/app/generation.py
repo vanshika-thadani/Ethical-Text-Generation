@@ -65,76 +65,69 @@ else:
 # Rewrite candidate validation
 # ---------------------------------------------------------------------------
 
-def is_valid_rewrite_candidate(text: str) -> bool:
+def is_valid_rewrite_candidate(text: str, original: str = "") -> bool:
     """
-    Structurally validate a rewrite candidate without hardcoding specific phrases.
+    Validate a rewrite candidate with relaxed rules so concise valid rewrites
+    are not rejected.
 
-    The checks are based on what a genuine rewritten sentence looks like,
-    not on a blocklist of known bad strings (which is always incomplete).
+    Rejects if ANY of these are true:
+      1. Empty or whitespace-only
+      2. Fewer than 5 characters
+      3. Fewer than 3 words
+      4. No alphabetic characters at all
+      5. Ends with a colon (label/header, not a sentence)
+      6. Starts with a meta-prefix pattern (model narrating instead of rewriting)
+      7. Identical to the original input (no rewrite happened)
 
-    Rejects if ANY of these structural signals are present:
-
-    1. Too short — fewer than 8 characters can't be a real sentence.
-
-    2. No alphabetic characters — pure punctuation/symbols.
-
-    3. Ends with a colon — "Output:", "Rewritten:", "In English:", etc.
-       A real sentence never ends with a colon.
-
-    4. Starts with a known meta-prefix pattern — catches "Output:", "Input:",
-       "Assistant:", "Rewritten:", "Here is", "Here's", "A safer", etc.
-       Detected by regex so it generalises to any variant, not a fixed list.
-
-    5. Ratio of alphabetic characters to total characters is below 40% —
-       catches outputs that are mostly punctuation, underscores, or symbols
-       even if they contain a few letters.
-
-    6. Word count is 1 — a single word is never a valid rewrite.
+    Logs the rejection reason so failures are easy to diagnose.
     """
     if not text:
+        logger.warning("Rejected rewrite: empty string")
         return False
 
     stripped = text.strip()
 
     # 1. Too short
-    if len(stripped) < 8:
+    if len(stripped) < 5:
+        logger.warning(f"Rejected rewrite (too short, {len(stripped)} chars): {repr(stripped)}")
         return False
 
-    # 2. No letters
+    # 2. No alphabetic characters
     if not re.search(r"[a-zA-Z]", stripped):
+        logger.warning(f"Rejected rewrite (no letters): {repr(stripped)}")
         return False
 
-    # 3. Ends with a colon — structural sign of a label/header, not a sentence
+    # 3. Fewer than 3 words
+    words = stripped.split()
+    if len(words) < 3:
+        logger.warning(f"Rejected rewrite (only {len(words)} words): {repr(stripped)}")
+        return False
+
+    # 4. Ends with a colon — structural sign of a label, not a sentence
     if stripped.endswith(":"):
+        logger.warning(f"Rejected rewrite (ends with colon): {repr(stripped)}")
         return False
 
-    # 4. Starts with a meta-prefix pattern.
-    #    Matches things like:
-    #      "Output:", "Input:", "Assistant:", "Rewritten:", "Rewrite:",
-    #      "Here is", "Here's", "A safer", "A rewritten", "The rewritten",
-    #      "One way to", "This could be", "You could say"
-    #    The pattern is: optional article/determiner + descriptive noun/verb phrase
-    #    followed by a colon OR a verb like "is/would/could/can".
+    # 5. Starts with a meta-prefix pattern — model is narrating instead of rewriting.
+    #    Matches: "Output:", "Here is", "Here's", "A safer version", "The rewritten",
+    #    "This could be", "You could say", "Sentence:", "Rewrite:" etc.
     meta_prefix = re.compile(
         r"^("
-        r"(output|input|assistant|rewritten?|safer version|example|sentence)\s*:"  # label: value
-        r"|here\s+(is|are|'s)\b"          # "Here is", "Here are", "Here's"
-        r"|(a|the|one)\s+\w+\s+(version|way|rewrite|sentence|example)\b"  # "A safer version"
-        r"|this\s+(could|would|can|is)\b"  # "This could be"
-        r"|you\s+could\s+say\b"            # "You could say"
+        r"(output|input|assistant|rewritten?|safer version|example|sentence|rewrite)\s*:"
+        r"|here\s+(is|are|'s)\b"
+        r"|(a|the|one)\s+\w+\s+(version|way|rewrite|sentence|example)\b"
+        r"|this\s+(could|would|can|is)\b"
+        r"|you\s+could\s+say\b"
         r")",
         re.IGNORECASE,
     )
     if meta_prefix.match(stripped):
+        logger.warning(f"Rejected rewrite (meta-prefix): {repr(stripped)}")
         return False
 
-    # 5. Low alpha ratio — mostly symbols/punctuation
-    alpha_count = sum(1 for c in stripped if c.isalpha())
-    if len(stripped) > 0 and alpha_count / len(stripped) < 0.40:
-        return False
-
-    # 6. Single word — not a sentence
-    if len(stripped.split()) < 2:
+    # 6. Identical to original input — model echoed the prompt unchanged
+    if original and stripped.strip('"\'').lower() == original.strip().lower():
+        logger.warning(f"Rejected rewrite (identical to original): {repr(stripped)}")
         return False
 
     return True
@@ -449,7 +442,7 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
         logger.debug(f"Rewrite attempt {attempt + 1} cleaned: {repr(cleaned)}")
 
         # 6. Validate
-        if is_valid_rewrite_candidate(cleaned):
+        if is_valid_rewrite_candidate(cleaned, original=input_text):
             results.append(cleaned)
         else:
             logger.warning(
