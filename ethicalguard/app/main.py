@@ -101,9 +101,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,   # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -460,24 +461,43 @@ def analyze_document(req: AnalyzeDocumentRequest):
         # since we're analysing it in isolation (no question context).
         scores = scoring.score_candidate(chunk_text, chunk_text, DEFAULT_ALPHA)
 
-        # Flag the chunk if its ethics score is below the safety threshold
-        flagged = scores.ethics_score < CHUNK_ANALYSIS_FLAG_THRESHOLD
+        # toxicity_score is a SAFETY score (1.0 = safe, 0.0 = toxic).
+        # Convert to risk score for threshold comparisons.
+        toxicity_risk = round(1.0 - scores.toxicity_score, 4)
+        # bias_score is also a SAFETY score (1.0 = unbiased).
+        # Convert to risk score.
+        bias_risk = round(1.0 - scores.bias_score, 4)
 
-        # Severity label based on combined risk score:
-        #   HIGH   → ethics < 0.4  (strongly unsafe)
-        #   MEDIUM → ethics < 0.6  (moderately unsafe)
-        #   LOW    → ethics >= 0.6 (safe)
-        if scores.ethics_score < 0.4:
+        logger.info(
+            f"Chunk {chunk_index} | "
+            f"toxicity_risk={toxicity_risk:.3f} "
+            f"bias_risk={bias_risk:.3f} "
+            f"manipulation_penalty={scores.manipulation_penalty:.3f} "
+            f"ethics_score={scores.ethics_score:.3f}"
+        )
+
+        # Severity based on raw risk signals — NOT the composite ethics_score.
+        # ethics_score blends in sentiment and coherence which can mask toxicity.
+        #
+        # HIGH   : clearly toxic, manipulative, or biased content
+        # MEDIUM : moderately risky content worth reviewing
+        # LOW    : safe
+        if toxicity_risk > 0.7 or scores.manipulation_penalty > 0.4 or bias_risk > 0.6:
             severity = "HIGH"
-        elif scores.ethics_score < CHUNK_ANALYSIS_FLAG_THRESHOLD:
+        elif toxicity_risk > 0.4 or bias_risk > 0.3:
             severity = "MEDIUM"
         else:
             severity = "LOW"
+
+        flagged = severity in ("HIGH", "MEDIUM")
+
+        logger.info(f"Chunk {chunk_index} → severity={severity}, flagged={flagged}")
 
         chunk_analyses.append(ChunkAnalysis(
             chunk=chunk_text,
             chunk_index=chunk_index,
             toxicity_score=scores.toxicity_score,
+            toxicity_risk=toxicity_risk,
             bias_score=scores.bias_score,
             manipulation_penalty=scores.manipulation_penalty,
             ethics_score=scores.ethics_score,

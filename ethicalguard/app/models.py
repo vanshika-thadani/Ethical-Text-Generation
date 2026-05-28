@@ -148,14 +148,13 @@ class ChunkAnalysis(BaseModel):
     """Ethical analysis result for a single document chunk."""
     chunk: str
     chunk_index: int
-    toxicity_score: float
-    bias_score: float
-    manipulation_penalty: float
-    ethics_score: float
-    # Flag: True if any metric is below the safe threshold
+    toxicity_score: float       # safety score: 1.0 = safe, 0.0 = toxic
+    toxicity_risk: float        # risk score: 1 - toxicity_score (high = dangerous)
+    bias_score: float           # safety score: 1.0 = unbiased
+    manipulation_penalty: float # 0.0–0.5, higher = more manipulative
+    ethics_score: float         # composite safety score
     flagged: bool
-    # Severity label based on combined ethical risk: LOW / MEDIUM / HIGH
-    severity: str = "LOW"
+    severity: str = "LOW"       # LOW / MEDIUM / HIGH
 
 
 class AnalyzeDocumentRequest(BaseModel):

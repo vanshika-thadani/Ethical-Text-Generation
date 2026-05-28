@@ -45,8 +45,9 @@ export interface AskResponse {
 export interface ChunkAnalysis {
   chunk: string;
   chunk_index: number;
-  toxicity_score: number;
-  bias_score: number;
+  toxicity_score: number;    // safety score: 1.0 = safe
+  toxicity_risk: number;     // risk score: 1 - toxicity_score (high = dangerous)
+  bias_score: number;        // safety score: 1.0 = unbiased
   manipulation_penalty: number;
   ethics_score: number;
   flagged: boolean;

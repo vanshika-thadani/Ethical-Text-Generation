@@ -27,6 +27,15 @@ function ChunkCard({ chunk }: { chunk: ChunkAnalysis }) {
 
   const cfg = SEVERITY_CONFIG[chunk.severity] ?? SEVERITY_CONFIG.LOW;
 
+  // Console log for debugging — visible in browser DevTools
+  console.log(
+    `[EthicalGuard] Chunk ${chunk.chunk_index} | ` +
+    `toxicity_risk=${chunk.toxicity_risk?.toFixed(3)} ` +
+    `bias_risk=${(1 - chunk.bias_score).toFixed(3)} ` +
+    `manipulation_penalty=${chunk.manipulation_penalty?.toFixed(3)} ` +
+    `severity=${chunk.severity}`
+  );
+
   async function handleInlineRewrite() {
     setRewriting(true);
     setRewriteError('');
@@ -69,11 +78,12 @@ function ChunkCard({ chunk }: { chunk: ChunkAnalysis }) {
         </button>
       </div>
 
-      {/* Score bars */}
+      {/* Score bars — Risk bars use invert=true so red = high risk */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <ScoreBar label="Toxicity Safety"      value={chunk.toxicity_score} />
-        <ScoreBar label="Bias Safety"          value={chunk.bias_score} />
+        <ScoreBar label="Toxicity Risk"        value={chunk.toxicity_risk ?? (1 - chunk.toxicity_score)} invert />
+        <ScoreBar label="Bias Risk"            value={1 - chunk.bias_score} invert />
         <ScoreBar label="Ethics Score"         value={chunk.ethics_score} />
+        <ScoreBar label="Manipulation Penalty" value={chunk.manipulation_penalty} invert />
         <ScoreBar label="Manipulation Penalty" value={chunk.manipulation_penalty} invert />
       </div>
 
