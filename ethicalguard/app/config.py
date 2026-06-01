@@ -12,15 +12,18 @@ import os
 # ---------------------------------------------------------------------------
 # Generation model
 # ---------------------------------------------------------------------------
-# Primary model: microsoft/phi-2 — a 2.7B instruction-tuned model that
-# produces high-quality rewrites and analysis on CPU/GPU.
+# Primary model: microsoft/Phi-3-mini-4k-instruct
+#   - 3.8B parameters, instruction-tuned (SFT + DPO + RLHF)
+#   - Fits on Colab T4 GPU (~7.5 GB VRAM in float16)
+#   - Uses native chat tokens: <|system|> <|user|> <|assistant|> <|end|>
+#   - Requires trust_remote_code=True
 #
-# Fallback chain: phi-2 → TinyLlama → distilgpt2
+# Fallback chain: Phi-3-mini → TinyLlama → distilgpt2
 # Each fallback is tried automatically if the previous one fails to load.
 #
-# Override via environment variable:
-#   set GEN_MODEL_NAME=microsoft/phi-2                          # Windows
-#   export GEN_MODEL_NAME=microsoft/phi-2                       # Linux/macOS
+# On Colab: set env var to Drive cache path so it loads in ~90s instead of
+# re-downloading every session:
+#   os.environ["GEN_MODEL_NAME"] = "/content/drive/MyDrive/ethicalguard_models/phi3-mini-instruct"
 
 GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
 GEN_MODEL_FALLBACK: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -32,6 +35,9 @@ GEN_MODEL_FALLBACK2: str = "distilgpt2"   # last-resort fallback for CPU-only ma
 TOXICITY_MODEL: str = "facebook/roberta-hate-speech-dynabench-r4-target"
 SENTIMENT_MODEL: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 BIAS_MODEL: str = "valurank/distilroberta-bias"
+
+# SBERT_MODEL_PATH env var lets you point at a Drive-cached copy on Colab:
+#   os.environ["SBERT_MODEL_PATH"] = "/content/drive/MyDrive/ethicalguard_models/all-MiniLM-L6-v2"
 SBERT_MODEL: str = os.getenv("SBERT_MODEL_PATH", "all-MiniLM-L6-v2")
 
 # ---------------------------------------------------------------------------
@@ -52,8 +58,6 @@ PROMPT_BLOCK_THRESHOLD: float = 0.7
 # ---------------------------------------------------------------------------
 # Manipulation penalty
 # ---------------------------------------------------------------------------
-# Each trigger word found in the text adds MANIPULATION_PENALTY_PER_WORD.
-# Total penalty is capped at MANIPULATION_PENALTY_MAX.
 MANIPULATION_TRIGGERS: list = [
     "always",
     "everyone",
@@ -72,91 +76,75 @@ MANIPULATION_PENALTY_MAX: float = 0.5
 # ---------------------------------------------------------------------------
 # Generation defaults
 # ---------------------------------------------------------------------------
-DEFAULT_MAX_TOKENS: int = 50
+DEFAULT_MAX_TOKENS: int = 100   # increased from 50 — Phi-3 needs more room
 DEFAULT_BEAMS: int = 5
 DEFAULT_ALPHA: float = 0.7
 
 # ---------------------------------------------------------------------------
-# Instruction prompt wrapper
+# Instruction prompt wrapper (used by /generate and /ask)
 # ---------------------------------------------------------------------------
-# Wraps the raw user prompt before passing it to the generation model.
-# This steers even lightweight models like distilgpt2 toward safe, respectful
-# outputs without any fine-tuning.
+# Uses Phi-3 native chat tokens: <|system|>, <|user|>, <|assistant|>, <|end|>
 #
-# IMPORTANT: this wrapped prompt is used ONLY for generation.
-# Scoring (coherence, toxicity, etc.) always compares against the original
-# user prompt so results remain meaningful and unbiased by the wrapper.
+# IMPORTANT:
+#   - Do NOT apply apply_chat_template() on top of this in generation.py.
+#     The tokens are already embedded in the string.
+#   - Scoring always compares against the ORIGINAL user prompt, not this
+#     wrapper, so coherence scores remain meaningful.
+#   - TinyLlama / distilgpt2 will see the raw tokens as text — not ideal,
+#     but they will still produce coherent output. The fallback is intentional.
+
 INSTRUCTION_PROMPT_TEMPLATE: str = (
-    "You are EthicalGuard, an AI content moderation and safety analysis system. "
-    "Analyze the following content and respond in a factual, neutral, and informative way. "
-    "Focus on identifying ethical issues, biases, or unsafe patterns if present.\n"
-    "User: {prompt}\n"
-    "Assistant:"
+    "<|system|>\n"
+    "You are EthicalGuard, an AI safety and content analysis assistant. "
+    "Respond in a factual, neutral, and informative way. "
+    "Identify ethical issues, biases, or unsafe patterns if present.<|end|>\n"
+    "<|user|>\n"
+    "{prompt}<|end|>\n"
+    "<|assistant|>\n"
 )
 
 # ---------------------------------------------------------------------------
-# Rewrite-specific few-shot prompt (used ONLY by /rewrite endpoint)
+# Rewrite-specific prompt (used ONLY by /rewrite endpoint)
 # ---------------------------------------------------------------------------
-# This prompt is NOT used for /ask or /generate.
-# It uses few-shot examples to teach the model to preserve meaning while
-# removing manipulation, toxicity, and emotional aggression.
-# The {input_text} placeholder is replaced with the user's actual text.
+# Uses Phi-3 native chat tokens — do NOT apply apply_chat_template() on top.
+#
+# Design decisions:
+#   - System message is short and precise: one job, one output format.
+#   - "Output ONLY the rewritten sentence" is the most important instruction.
+#     Phi-3 respects this reliably; phi-2 did not.
+#   - No few-shot examples needed — Phi-3 follows instructions without them.
+#     (Few-shot examples actually caused phi-2 to continue the list pattern
+#     instead of rewriting. Phi-3 doesn't have this problem.)
+#   - <|end|> after <|user|> closes the user turn cleanly.
+#   - <|assistant|> with no content prompts the model to start generating.
+
 REWRITE_PROMPT_TEMPLATE: str = (
-    "You are an ethical AI rewriting assistant.\n\n"
-    "Task: Rewrite the sentence below to remove personal attacks, threats, manipulation, "
-    "or toxic language — while keeping the speaker's core complaint, concern, or feeling intact.\n\n"
-    "Transformation principle:\n"
-    "  Keep: the underlying emotion, concern, or complaint\n"
-    "  Remove: blame at a specific person, threats, manipulation, insults\n"
-    "  Replace: 'you ruined this' → 'this situation did not go well'\n"
-    "  Replace: 'you never care' → 'I feel uncared for in this situation'\n"
-    "  Replace: 'you will regret this' → 'I hope we can resolve this'\n\n"
-    "Output rules:\n"
-    "- Write exactly one complete sentence. Nothing more.\n"
-    "- Use first-person when expressing emotion ('I feel...', 'I think...', 'I hope...')\n"
-    "- Do not add filler phrases like 'Thank you' or 'I appreciate'\n"
-    "- Do not describe what you are doing\n"
-    "- Do not include any label, prefix, or quote marks\n"
-    "- Do not continue with more examples after writing the sentence\n\n"
-    "### Few-shot examples (do not continue this list) ###\n\n"
-    "Sentence: You must listen to me or you will regret it.\n"
-    "Rewrite: I hope you will consider what I am saying so we can resolve this together.\n\n"
-    "Sentence: People like you always ruin everything.\n"
-    "Rewrite: I feel frustrated because this situation did not turn out well.\n\n"
-    "Sentence: Everyone else agrees with me. You are the only problem here.\n"
-    "Rewrite: Several people see this differently, so I think we should discuss it without placing blame.\n\n"
-    "Sentence: After all I did for you, this is how you treat me?\n"
-    "Rewrite: I feel hurt because I expected more consideration after everything I contributed.\n\n"
-    "Sentence: If you leave me, I will never recover.\n"
-    "Rewrite: I am worried about what will happen to our relationship if we cannot work this out.\n\n"
-    "### Now rewrite this sentence — write only the rewrite, nothing else ###\n\n"
-    "Sentence: {input_text}\n"
-    "Rewrite:"
+    "<|system|>\n"
+    "You are an ethical AI rewriting assistant. "
+    "Rewrite the given sentence to remove toxic, manipulative, threatening, or harmful language "
+    "while keeping the speaker's core feeling or concern intact. "
+    "Output ONLY the rewritten sentence — no explanation, no label, no quotes, nothing else.<|end|>\n"
+    "<|user|>\n"
+    "Rewrite this sentence ethically:\n\n"
+    "{input_text}<|end|>\n"
+    "<|assistant|>\n"
 )
 
-# Prefixes that instruction-tuned models sometimes prepend to their output.
-# These are stripped from rewrite results so only the clean sentence is returned.
+# Prefixes that models sometimes prepend to their output.
+# These are stripped in generation.py post-processing.
+# Phi-3 rarely produces these, but they're kept for fallback models.
 REWRITE_OUTPUT_STRIP_PREFIXES: list = [
-    "Rewrite:", "EthicalCoach:", "Assistant:", "Output:", "Rewrite:", "Answer:",
+    "Rewrite:", "Output:", "Assistant:", "Answer:",
     "EthicalGuard:", "Safe version:", "Safer version:", "Sentence:",
+    "Rewritten sentence:", "Here is the rewritten sentence:",
 ]
-# distilgpt2 occasionally generates zero new tokens (e.g. when the prompt
-# fills the max_length budget or sampling collapses to eos immediately).
-# This neutral, safe sentence is substituted whenever that happens so the
-# scoring pipeline never receives an empty string.
+
+# Substituted when the model produces zero tokens (rare with Phi-3).
 EMPTY_OUTPUT_FALLBACK: str = "I recommend expressing your feelings honestly and respectfully."
 
 # ---------------------------------------------------------------------------
 # RAG / Vector DB settings
 # ---------------------------------------------------------------------------
-# VECTORDB_PATH      : where FAISS index files are persisted between restarts.
-# RAG_COLLECTION_NAME: logical name (used as a label, not a DB collection).
-# RAG_TOP_K          : default number of chunks to retrieve per question.
-# CHUNK_SIZE         : target words per chunk during document ingestion.
-# CHUNK_OVERLAP      : words shared between consecutive chunks (preserves
-#                      context at boundaries so no sentence is cut in half).
-# UPLOAD_DIR         : where uploaded files are saved before ingestion.
-
 VECTORDB_PATH: str = os.getenv("VECTORDB_PATH", "vectordb")
 RAG_COLLECTION_NAME: str = "ethicalguard_docs"
 RAG_TOP_K: int = 3

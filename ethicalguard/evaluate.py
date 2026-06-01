@@ -31,7 +31,7 @@ METRICS EXPLAINED
 toxicity_score      : 1.0 = safe, 0.0 = toxic  (higher is better)
 bias_score          : 1.0 = unbiased            (higher is better)
 final_score         : combined ethics + fluency  (higher is better)
-toxicity_reduction  : baseline_tox - ranked_tox  (positive = improvement)
+toxicity_safety_gain: ranked_tox - baseline_tox  (positive = improvement)
 final_score_gain    : ranked_final - baseline_final (positive = improvement)
 """
 
@@ -56,10 +56,10 @@ SUMMARY_JSON = os.path.join("results", "summary.json")
 
 # Request parameters — keep beams low for faster evaluation
 DEFAULT_BEAMS = 3
-DEFAULT_MAX_TOKENS = 50
+DEFAULT_MAX_TOKENS = 100   # matches new DEFAULT_MAX_TOKENS in config.py
 DEFAULT_ALPHA = 0.7
 
-# Seconds to wait between requests (be kind to your CPU)
+# Seconds to wait between requests (be kind to your GPU)
 REQUEST_DELAY = 0.5
 
 
@@ -127,7 +127,7 @@ def call_compare(prompt: str):
         "alpha": DEFAULT_ALPHA,
     }
     try:
-        resp = requests.post(COMPARE_ENDPOINT, json=payload, timeout=120)
+        resp = requests.post(COMPARE_ENDPOINT, json=payload, timeout=180)
 
         # Blocked prompts return 400 — log and skip rather than crash
         if resp.status_code == 400:
@@ -169,7 +169,7 @@ def flatten_result(prompt: str, category: str, data: dict) -> dict:
         "ranked_toxicity": sr["toxicity_score"],
         "ranked_bias": sr["bias_score"],
         "ranked_final_score": sr["final_score"],
-        # Improvement
+        # Improvement — field names match the /compare response exactly
         "toxicity_safety_gain": imp["toxicity_safety_gain"],
         "bias_safety_gain": imp["bias_safety_gain"],
         "final_score_gain": imp["final_score_gain"],
@@ -182,18 +182,6 @@ def flatten_result(prompt: str, category: str, data: dict) -> dict:
 def compute_averages(rows: list[dict]) -> dict:
     """
     Compute mean values for all numeric columns, overall and per category.
-
-    Returns a dict structured as:
-    {
-        "overall": { "avg_baseline_toxicity": ..., ... },
-        "by_category": {
-            "normal": { ... },
-            "toxic": { ... },
-            ...
-        },
-        "total_prompts": N,
-        "blocked_prompts": M,
-    }
     """
     numeric_cols = [
         "baseline_toxicity", "baseline_bias", "baseline_final_score",
@@ -275,19 +263,18 @@ def main():
         response = call_compare(prompt)
 
         if response is None:
-            # Blocked or failed — count it but don't add to results
             blocked_count += 1
             continue
 
         row = flatten_result(prompt, category, response)
         result_rows.append(row)
 
-        # Show a quick summary line
+        # ── fixed: was referencing non-existent 'toxicity_reduction' key ──
         print(
             f"  baseline={row['baseline_final_score']:.3f}  "
             f"ranked={row['ranked_final_score']:.3f}  "
             f"gain={row['final_score_gain']:+.3f}  "
-            f"tox_reduction={row['toxicity_reduction']:+.3f}"
+            f"tox_gain={row['toxicity_safety_gain']:+.3f}"
         )
 
         time.sleep(REQUEST_DELAY)
@@ -306,13 +293,13 @@ def main():
     # 6. Print headline numbers
     ov = summary["overall"]
     print("\n--- Overall Averages ---")
-    print(f"  Baseline  toxicity : {ov.get('avg_baseline_toxicity', 'N/A')}")
-    print(f"  Ranked    toxicity : {ov.get('avg_ranked_toxicity', 'N/A')}")
-    print(f"  Toxicity safety gain : {ov.get('avg_toxicity_safety_gain', 'N/A')}")
-    print(f"  Bias safety gain     : {ov.get('avg_bias_safety_gain', 'N/A')}")
-    print(f"  Baseline  final    : {ov.get('avg_baseline_final_score', 'N/A')}")
-    print(f"  Ranked    final    : {ov.get('avg_ranked_final_score', 'N/A')}")
-    print(f"  Final score gain   : {ov.get('avg_final_score_gain', 'N/A')}")
+    print(f"  Baseline  toxicity     : {ov.get('avg_baseline_toxicity', 'N/A')}")
+    print(f"  Ranked    toxicity     : {ov.get('avg_ranked_toxicity', 'N/A')}")
+    print(f"  Toxicity safety gain   : {ov.get('avg_toxicity_safety_gain', 'N/A')}")
+    print(f"  Bias safety gain       : {ov.get('avg_bias_safety_gain', 'N/A')}")
+    print(f"  Baseline  final score  : {ov.get('avg_baseline_final_score', 'N/A')}")
+    print(f"  Ranked    final score  : {ov.get('avg_ranked_final_score', 'N/A')}")
+    print(f"  Final score gain       : {ov.get('avg_final_score_gain', 'N/A')}")
     print("=" * 60)
 
 
