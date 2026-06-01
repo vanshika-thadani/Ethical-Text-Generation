@@ -9,19 +9,48 @@ import type {
   CompareResponse,
 } from '../types/api';
 
-// Axios instance pointing at the FastAPI backend.
-// All components import from here — never hardcode the base URL elsewhere.
+// ---------------------------------------------------------------------------
+// Base URL resolution
+// ---------------------------------------------------------------------------
+// Priority:
+//   1. VITE_API_URL environment variable  (set in .env.local for Colab/remote)
+//   2. http://127.0.0.1:8000              (default for local development)
+//
+// To point at a Colab backend, create ethicalguard-ui/.env.local:
+//   VITE_API_URL=https://<your-ngrok-or-colab-url>
+//
+// Vite automatically loads .env.local and exposes VITE_* variables.
+// Never commit .env.local — it is already in .gitignore.
+
+const BASE_URL: string =
+  import.meta.env.VITE_API_URL?.replace(/\/$/, '') || 'http://127.0.0.1:8000';
+
+// Axios instance — all components import from here, never hardcode URLs.
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:8000',
+  baseURL: BASE_URL,
   timeout: 120_000, // 2 min — generation can be slow on CPU
+  headers: {
+    // Colab's built-in proxy shows an auth/warning page for browser requests
+    // unless this header is present. It tells the proxy to skip the interstitial
+    // and forward the request directly to the FastAPI server.
+    'ngrok-skip-browser-warning': 'true',
+    // Some Colab proxy versions check for this instead
+    'bypass-tunnel-reminder': 'true',
+  },
 });
 
 // Human-readable error extractor.
-// If the backend is unreachable, show a helpful startup message.
 export function getErrorMessage(err: unknown): string {
   if (err instanceof AxiosError) {
     if (!err.response) {
-      return 'Backend server not running. Start it using: uvicorn app.main:app --reload';
+      // Network error — could be CORS, server down, or wrong URL
+      const isCors = err.message?.toLowerCase().includes('network');
+      return isCors
+        ? `Cannot reach backend at ${BASE_URL}.\n\n` +
+          `If using Colab's built-in proxy: open ${BASE_URL} in this browser first to authenticate, ` +
+          `or switch to ngrok for reliable CORS support.\n\n` +
+          `If running locally: uvicorn app.main:app --reload`
+        : `Backend not reachable at ${BASE_URL}. Check that the server is running.`;
     }
     const detail = err.response.data?.detail;
     if (typeof detail === 'string') return detail;

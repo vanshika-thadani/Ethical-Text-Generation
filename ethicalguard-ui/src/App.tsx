@@ -151,7 +151,13 @@ export default function App() {
 
         {/* Sidebar footer */}
         <div className="px-5 py-4 border-t border-slate-100 space-y-1">
-          <p className="text-[10px] text-slate-400">Backend: <span className="font-mono">127.0.0.1:8000</span></p>
+          <p className="text-[10px] text-slate-400 truncate" title={import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'}>
+            Backend: <span className="font-mono">{
+              (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000')
+                .replace(/^https?:\/\//, '')
+                .substring(0, 28)
+            }{(import.meta.env.VITE_API_URL || '').length > 28 ? '…' : ''}</span>
+          </p>
           <p className="text-[10px] text-slate-300">Browser extension: coming soon</p>
         </div>
       </aside>
