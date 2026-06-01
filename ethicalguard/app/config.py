@@ -22,7 +22,7 @@ import os
 #   set GEN_MODEL_NAME=microsoft/phi-2                          # Windows
 #   export GEN_MODEL_NAME=microsoft/phi-2                       # Linux/macOS
 
-GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "microsoft/phi-2")
+GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
 GEN_MODEL_FALLBACK: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 GEN_MODEL_FALLBACK2: str = "distilgpt2"   # last-resort fallback for CPU-only machines
 
@@ -32,7 +32,7 @@ GEN_MODEL_FALLBACK2: str = "distilgpt2"   # last-resort fallback for CPU-only ma
 TOXICITY_MODEL: str = "facebook/roberta-hate-speech-dynabench-r4-target"
 SENTIMENT_MODEL: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 BIAS_MODEL: str = "valurank/distilroberta-bias"
-SBERT_MODEL: str = "all-MiniLM-L6-v2"
+SBERT_MODEL: str = os.getenv("SBERT_MODEL_PATH", "all-MiniLM-L6-v2")
 
 # ---------------------------------------------------------------------------
 # Scoring weights
