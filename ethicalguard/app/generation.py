@@ -66,7 +66,33 @@ else:
 # Stop token helper
 # ---------------------------------------------------------------------------
 
-def _build_stop_tokens(tokenizer) -> list:
+def _get_model_input_device():
+    """
+    Resolve the correct input device for the generation model.
+
+    With device_map="auto" (Accelerate), gen_model.device and
+    next(gen_model.parameters()).device both return "meta" — a dispatch
+    proxy device, not a real device. Inputs sent to "meta" cause:
+      "Tensor on device cuda:0 is not on the expected device meta"
+
+    Fix: read from hf_device_map (populated by Accelerate) to find the
+    first real CUDA device. Fall back to scanning parameters, then CPU.
+    """
+    try:
+        if hasattr(gen_model, "hf_device_map") and gen_model.hf_device_map:
+            devices = list(gen_model.hf_device_map.values())
+            cuda_devs = [d for d in devices if isinstance(d, int) or
+                         (isinstance(d, str) and "cuda" in str(d))]
+            if cuda_devs:
+                d = cuda_devs[0]
+                return f"cuda:{d}" if isinstance(d, int) else d
+        # Fallback: first non-meta parameter
+        for param in gen_model.parameters():
+            if param.device.type != "meta":
+                return param.device
+    except Exception:
+        pass
+    return "cpu"
     """
     Build the list of token IDs that should stop generation.
 
@@ -308,7 +334,8 @@ def generate_one(prompt: str, max_tokens: int) -> str:
     formatted = INSTRUCTION_PROMPT_TEMPLATE.format(prompt=prompt)
 
     inputs = gen_tokenizer(formatted, return_tensors="pt")
-    inputs = {k: v.to(gen_model.device) for k, v in inputs.items()}
+    input_device = _get_model_input_device()
+    inputs = {k: v.to(input_device) for k, v in inputs.items()}
 
     output = gen_model.generate(
         **inputs,
@@ -414,7 +441,8 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
             break
 
         inputs = gen_tokenizer(formatted, return_tensors="pt")
-        inputs = {k: v.to(gen_model.device) for k, v in inputs.items()}
+        input_device = _get_model_input_device()
+        inputs = {k: v.to(input_device) for k, v in inputs.items()}
 
         output = gen_model.generate(
             **inputs,

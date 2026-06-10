@@ -301,10 +301,28 @@ def _fluency_score(text: str) -> float:
     inputs = _gen_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
     )
-    # Move inputs to the same device as the generation model.
-    # This is required when the model is on GPU — CPU tensors cannot be
-    # passed to a CUDA model.
-    model_device = next(_gen_model.parameters()).device
+    # When device_map="auto" is used (Accelerate), next(model.parameters()).device
+    # returns "meta" for the dispatch proxy — not the real device.
+    # Instead, resolve the actual input device from the model's device map,
+    # falling back to the first non-meta device found, or "cpu" as last resort.
+    try:
+        if hasattr(_gen_model, "hf_device_map") and _gen_model.hf_device_map:
+            # hf_device_map maps layer names to devices, e.g. {"model.embed_tokens": 0}
+            # Use the first real device (not "cpu" or "meta" if possible)
+            devices = list(_gen_model.hf_device_map.values())
+            # Prefer cuda devices
+            cuda_devices = [d for d in devices if isinstance(d, int) or (isinstance(d, str) and "cuda" in str(d))]
+            model_device = f"cuda:{cuda_devices[0]}" if cuda_devices and isinstance(cuda_devices[0], int) else (cuda_devices[0] if cuda_devices else "cpu")
+        else:
+            # Fallback: find first non-meta parameter
+            model_device = "cpu"
+            for param in _gen_model.parameters():
+                if param.device.type != "meta":
+                    model_device = param.device
+                    break
+    except Exception:
+        model_device = "cpu"
+
     inputs = {k: v.to(model_device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = _gen_model(**inputs, labels=inputs["input_ids"])
