@@ -17,7 +17,6 @@ python-multipart==0.0.9   # required for FastAPI file uploads
 torch==2.3.0
 transformers==4.41.2      # pinned: Phi-3 requires >=4.40; 4.41.2 tested on Colab T4
 accelerate==0.30.1        # device_map="auto" and float16 loading
-peft==0.11.1              # required by some transformers pipelines on Colab
 
 # --- Embeddings & similarity ---
 sentence-transformers==2.7.0   # SBERT for coherence scoring and RAG retrieval
