@@ -570,12 +570,12 @@ def rewrite(req: RewriteRequest):
             and scores_before.toxicity_score >= 0.95
             and scores_before.manipulation_penalty == 0
         ):
-        return RewriteResponse(
-            original=req.text,
-            ethical_rewrite=req.text,
-            scores_before=scores_before,
-            scores_after=scores_before,
-        )
+            return RewriteResponse(
+                original=req.text,
+                ethical_rewrite=req.text,
+                scores_before=scores_before,
+                scores_after=scores_before,
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scoring original text failed: {exc}")
 
