@@ -62,53 +62,62 @@ else:
     logger.info("CUDA not available — running on CPU")
 
 
+
 # ---------------------------------------------------------------------------
-# Stop token helper
+# Stop token + device helpers
 # ---------------------------------------------------------------------------
+
+def _build_stop_tokens(tokenizer) -> list[int]:
+    """
+    Build token IDs that should stop generation.
+
+    For Phi-3-mini: includes EOS and <|end|>.
+    For TinyLlama / distilgpt2: usually only EOS is needed.
+    """
+    stop = []
+
+    if tokenizer.eos_token_id is not None:
+        stop.append(tokenizer.eos_token_id)
+
+    try:
+        end_id = tokenizer.convert_tokens_to_ids("<|end|>")
+        if (
+            end_id is not None
+            and end_id != tokenizer.unk_token_id
+            and end_id not in stop
+        ):
+            stop.append(end_id)
+            logger.info(f"Added <|end|> (id={end_id}) to stop tokens.")
+    except Exception:
+        pass
+
+    return stop
+
 
 def _get_model_input_device():
     """
-    Resolve the correct input device for the generation model.
+    Resolve correct input device for generation model.
 
-    With device_map="auto" (Accelerate), gen_model.device and
-    next(gen_model.parameters()).device both return "meta" — a dispatch
-    proxy device, not a real device. Inputs sent to "meta" cause:
-      "Tensor on device cuda:0 is not on the expected device meta"
-
-    Fix: read from hf_device_map (populated by Accelerate) to find the
-    first real CUDA device. Fall back to scanning parameters, then CPU.
+    With device_map='auto', model.device may be meta, so use hf_device_map.
     """
     try:
         if hasattr(gen_model, "hf_device_map") and gen_model.hf_device_map:
             devices = list(gen_model.hf_device_map.values())
-            cuda_devs = [d for d in devices if isinstance(d, int) or
-                         (isinstance(d, str) and "cuda" in str(d))]
+            cuda_devs = [
+                d for d in devices
+                if isinstance(d, int) or (isinstance(d, str) and "cuda" in str(d))
+            ]
             if cuda_devs:
                 d = cuda_devs[0]
                 return f"cuda:{d}" if isinstance(d, int) else d
-        # Fallback: first non-meta parameter
+
         for param in gen_model.parameters():
             if param.device.type != "meta":
                 return param.device
     except Exception:
         pass
-    return "cpu"
-    """
-    Build the list of token IDs that should stop generation.
 
-    For Phi-3-mini: includes both EOS and <|end|> (end-of-turn token).
-    Without <|end|>, the model continues past its answer into new fake turns.
-    For TinyLlama / distilgpt2: only EOS is needed.
-    """
-    stop = [tokenizer.eos_token_id]
-    try:
-        end_id = tokenizer.convert_tokens_to_ids("<|end|>")
-        if end_id is not None and end_id != tokenizer.unk_token_id and end_id not in stop:
-            stop.append(end_id)
-            logger.info(f"Added <|end|> (id={end_id}) to stop tokens.")
-    except Exception:
-        pass
-    return stop
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------
