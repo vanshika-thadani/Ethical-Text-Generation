@@ -236,35 +236,42 @@ def load_models() -> str:
                     f"Last error: {exc}"
                 )
 
-    # ── 2. Toxicity model ────────────────────────────────────────────────────
-    logger.info(f"Loading toxicity model: {TOXICITY_MODEL} ...")
+    # ── 2. Toxicity model — force CPU to save GPU memory for generation ────
+    logger.info(f"Loading toxicity model: {TOXICITY_MODEL} on CPU ...")
     try:
         reward_tokenizer = AutoTokenizer.from_pretrained(TOXICITY_MODEL)
-        reward_model = AutoModelForSequenceClassification.from_pretrained(TOXICITY_MODEL)
+        reward_model = AutoModelForSequenceClassification.from_pretrained(
+            TOXICITY_MODEL
+        ).to("cpu")   # explicitly on CPU — keeps VRAM free for Phi-3
+        logger.info(f"Toxicity model device: cpu")
     except Exception as exc:
         raise RuntimeError(f"Failed to load toxicity model ({TOXICITY_MODEL}): {exc}")
 
-    # ── 3. Sentiment model ───────────────────────────────────────────────────
-    logger.info(f"Loading sentiment model: {SENTIMENT_MODEL} ...")
+    # ── 3. Sentiment model — force CPU (device=-1 in pipeline) ──────────────
+    logger.info(f"Loading sentiment model: {SENTIMENT_MODEL} on CPU ...")
     try:
         sentiment_pipe = pipeline(
             "sentiment-analysis",
             model=SENTIMENT_MODEL,
             truncation=True,
             max_length=512,
+            device=-1,   # -1 = CPU, regardless of CUDA availability
         )
+        logger.info(f"Sentiment pipeline device: cpu")
     except Exception as exc:
         raise RuntimeError(f"Failed to load sentiment model ({SENTIMENT_MODEL}): {exc}")
 
-    # ── 4. Bias model ────────────────────────────────────────────────────────
-    logger.info(f"Loading bias model: {BIAS_MODEL} ...")
+    # ── 4. Bias model — force CPU (device=-1 in pipeline) ───────────────────
+    logger.info(f"Loading bias model: {BIAS_MODEL} on CPU ...")
     try:
         bias_pipe = pipeline(
             "text-classification",
             model=BIAS_MODEL,
             truncation=True,
             max_length=512,
+            device=-1,   # -1 = CPU
         )
+        logger.info(f"Bias pipeline device: cpu")
     except Exception as exc:
         raise RuntimeError(f"Failed to load bias model ({BIAS_MODEL}): {exc}")
 
@@ -331,7 +338,16 @@ def generate_candidates(prompt: str, num_candidates: int, max_tokens: int) -> li
     """
     Generate num_candidates non-empty completions for the prompt.
     Each call uses stochastic sampling so outputs differ.
+    Logs CUDA memory before/after generation for OOM diagnosis.
     """
+    if _device == "cuda":
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(
+            f"generate_candidates() start — CUDA memory: "
+            f"allocated={alloc:.2f}GB reserved={reserved:.2f}GB"
+        )
+
     MAX_RETRIES = num_candidates * 3
     results = []
     attempts = 0
@@ -347,6 +363,14 @@ def generate_candidates(prompt: str, num_candidates: int, max_tokens: int) -> li
     while len(results) < num_candidates:
         logger.warning("Padding candidates with fallback text after max retries.")
         results.append(EMPTY_OUTPUT_FALLBACK)
+
+    if _device == "cuda":
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(
+            f"generate_candidates() end — CUDA memory: "
+            f"allocated={alloc:.2f}GB reserved={reserved:.2f}GB"
+        )
 
     return results
 

@@ -173,8 +173,10 @@ def set_scoring_models(
     # Resolve which output index is the "safe" class — do this once at startup.
     _safe_label_index = _resolve_safe_label_index(reward_model)
 
-    # SBERT is lightweight — load it here so scoring.py owns it fully.
-    _sbert_model = SentenceTransformer(SBERT_MODEL)
+    # SBERT — force CPU to preserve GPU memory for Phi-3 generation.
+    # SBERT is small (80MB) and fast on CPU — no meaningful speed loss.
+    _sbert_model = SentenceTransformer(SBERT_MODEL, device="cpu")
+    _logger.info(f"SBERT device: cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +202,7 @@ def _toxicity_score(text: str) -> float:
     inputs = _reward_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
     )
+    # reward_model is loaded on CPU — keep inputs on CPU (no .to() needed)
     with torch.no_grad():
         logits = _reward_model(**inputs).logits
     probs = torch.softmax(logits, dim=-1)[0]
@@ -321,6 +324,14 @@ def _fluency_score(text: str) -> float:
 
     perplexity = math.exp(min(loss, 100.0))   # cap before exp to avoid overflow
     score = 1.0 / (1.0 + math.log(max(perplexity, 1.0)))
+
+    # Free GPU memory after using Phi-3 for fluency scoring.
+    # Fluency is the only metric that runs on GPU (via gen_model).
+    # Calling empty_cache() here prevents fragmentation accumulating
+    # across multiple score_candidate() calls in /ask reranking.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return safe_float(score, default=0.0, label="fluency_score")
 
 

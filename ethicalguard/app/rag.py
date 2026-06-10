@@ -100,10 +100,11 @@ def set_rag_sbert_model(sbert_model):
     """
     Inject the already-loaded SBERT model from scoring.py.
     Called once at startup so RAG and scoring share the same model instance.
+    SBERT is loaded on CPU in scoring.py — all encode() calls here stay on CPU.
     """
     global _sbert_model
     _sbert_model = sbert_model
-    logger.info("RAG: SBERT model injected.")
+    logger.info(f"RAG: SBERT model injected (device: {sbert_model.device}).")
 
 
 def init_vector_db():
