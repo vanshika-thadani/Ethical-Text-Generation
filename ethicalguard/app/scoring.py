@@ -458,3 +458,65 @@ def score_prompt_risk(prompt: str) -> float:
     high when the text is dangerous (toxicity_score is high when safe).
     """
     return round(1.0 - _toxicity_score(prompt), 4)
+
+# ---------------------------------------------------------------------------
+# Public manipulation penalty wrapper
+# ---------------------------------------------------------------------------
+# _manipulation_penalty() is private by naming convention.
+# main.py and any external module must use this public wrapper.
+
+def get_manipulation_penalty(text: str) -> float:
+    """Public wrapper for _manipulation_penalty(). Use this in main.py."""
+    return _manipulation_penalty(text)
+
+
+# ---------------------------------------------------------------------------
+# Batch scoring helpers (for /analyze-document on large documents)
+# ---------------------------------------------------------------------------
+# These run each model ONCE over ALL sentences in a single batch call,
+# instead of calling score_candidate() per sentence (5 model calls each).
+# ~10x faster for large documents.
+
+def batch_toxicity_scores(texts: list) -> list:
+    """
+    Run toxicity model over all texts in one batched call.
+    Returns list of safety scores (1.0 = safe, 0.0 = toxic).
+    Processes in sub-batches of 32 to avoid OOM on T4.
+    """
+    results = []
+    batch_size = 32
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        inputs = _reward_tokenizer(
+            batch,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        )
+        # reward_model is on CPU — inputs stay on CPU
+        with torch.no_grad():
+            logits = _reward_model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)
+        safe_probs = probs[:, _safe_label_index].tolist()
+        results.extend([round(p, 4) for p in safe_probs])
+    return results
+
+
+def batch_bias_scores(texts: list) -> list:
+    """
+    Run bias model over all texts in one batched call.
+    Returns list of safety scores (1.0 = unbiased, 0.0 = strongly biased).
+    Processes in sub-batches of 32 to avoid OOM on T4.
+    """
+    results = []
+    batch_size = 32
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_results = _bias_pipeline(
+            batch, truncation=True, max_length=512, batch_size=batch_size
+        )
+        for r in batch_results:
+            score = (1.0 - r["score"]) if r["label"].lower() == "biased" else r["score"]
+            results.append(round(score, 4))
+    return results

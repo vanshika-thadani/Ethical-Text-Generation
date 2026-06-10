@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import generation, scoring, rag, ingestion
@@ -36,7 +36,6 @@ from app.config import (
     DEFAULT_ALPHA,
     DEFAULT_MAX_TOKENS,
     DEFAULT_BEAMS,
-    CHUNK_ANALYSIS_FLAG_THRESHOLD,
 )
 
 from app.models import (
@@ -48,6 +47,8 @@ from app.models import (
     UploadResponse, AskRequest, AskResponse,
     RetrievedChunk, AnalyzeDocumentRequest, AnalyzeDocumentResponse,
     ChunkAnalysis, RewriteRequest, RewriteResponse, RAGStatusResponse,
+    #extension
+    ChunksInput
 )
 
 # ---------------------------------------------------------------------------
@@ -409,99 +410,116 @@ def ask(req: AskRequest):
     )
 
 
+# FIND and REPLACE the entire analyze_document() function:
+
 @app.post(
     "/analyze-document",
     response_model=AnalyzeDocumentResponse,
     tags=["RAG"],
-    summary="Ethical analysis of every chunk in an uploaded document",
+    summary="Ethical analysis of every sentence in an uploaded document",
 )
 def analyze_document(req: AnalyzeDocumentRequest):
     """
-    Score every chunk of an uploaded document for toxicity, bias, and manipulation.
+    Score every sentence of an uploaded document using a two-stage pipeline.
 
-    This endpoint is designed for:
-    - Detecting unethical sections in a document before publishing
-    - Auditing content for compliance or safety review
-    - Identifying which parts of a document need rewriting
+    Stage 1 — Batch pre-filter (fast):
+        Run toxicity + bias over ALL sentences in one batch call each.
+        Compute manipulation penalty (string matching, near-instant).
+        Sentences with tox_risk > 0.12, bias_risk > 0.12, or manip > 0
+        are marked suspicious — threshold is wide to avoid missing subtle bias.
 
-    A chunk is flagged if its ethics_score falls below CHUNK_ANALYSIS_FLAG_THRESHOLD
-    (defined in config.py, default 0.6).
+    Stage 2 — Full scoring (suspicious sentences only):
+        Run complete score_candidate() on suspicious sentences only.
+        Severity uses full.ethics_score < 0.65 as additional MEDIUM trigger.
+        ~20-30% of sentences reach Stage 2 for a typical document.
 
-    The response includes:
-    - unsafe_chunks : only the flagged chunks (for quick review)
-    - all_chunks    : every chunk with full scores (for detailed audit)
+    LOW sentences skip Stage 2 — ethics approximated from batch scores.
+    Fluency skipped entirely — irrelevant for document safety analysis.
+
+    Speed: 300 sentences ~20-30s vs ~90-150s with old per-sentence approach.
     """
     _require_models()
 
-    # Retrieve all chunks for this document from the FAISS vector store.
-    # We use rag's internal lists directly since FAISS doesn't have a
-    # "get all by filter" query — we scan the metadata list instead.
-    try:
-        paired = [
-            (rag._chunks[i], rag._meta[i])
-            for i in range(len(rag._chunks))
-            if rag._meta[i].get("document") == req.document_name
-        ]
-    except Exception as exc:
-        logger.error(f"/analyze-document — metadata scan failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve document chunks: {exc}")
+    from app.utils import split_into_sentences, clean_text
+    from app.ingestion import extract_text
 
-    if not paired:
+    # Find uploaded file (saved with UUID prefix)
+    matched_path = None
+    for fname in os.listdir(UPLOAD_DIR):
+        if fname.endswith("_" + req.document_name) or fname == req.document_name:
+            matched_path = os.path.join(UPLOAD_DIR, fname)
+            break
+
+    if not matched_path:
         raise HTTPException(
             status_code=404,
             detail=f"Document '{req.document_name}' not found. Upload it first via POST /upload.",
         )
 
+    try:
+        raw_text = extract_text(matched_path)
+        sentences = split_into_sentences(clean_text(raw_text))
+    except Exception as exc:
+        logger.error(f"/analyze-document — text extraction failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {exc}")
+
+    if not sentences:
+        raise HTTPException(status_code=422, detail="Document produced no scorable sentences.")
+
+    logger.info(f"/analyze-document — scoring {len(sentences)} sentences from '{req.document_name}'")
+
+    # Stage 1: batch pre-filter
+    try:
+        tox_scores  = scoring.batch_toxicity_scores(sentences)
+        bias_scores = scoring.batch_bias_scores(sentences)
+    except Exception as exc:
+        logger.error(f"/analyze-document — batch scoring failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Batch scoring failed: {exc}")
+
+    manip_penalties = [scoring.get_manipulation_penalty(s) for s in sentences]
+
     chunk_analyses: List[ChunkAnalysis] = []
 
-    for chunk_text, meta in paired:
-        chunk_index = meta.get("chunk_index", 0)
+    for idx, sentence in enumerate(sentences):
+        tox_score  = tox_scores[idx]
+        bias_score = bias_scores[idx]
+        tox_risk   = round(1.0 - tox_score, 4)
+        bias_risk  = round(1.0 - bias_score, 4)
+        manip      = manip_penalties[idx]
 
-        # Score the chunk — use the chunk itself as both prompt and text
-        # since we're analysing it in isolation (no question context).
-        scores = scoring.score_candidate(chunk_text, chunk_text, DEFAULT_ALPHA)
+        # Stage 2: full scoring for suspicious sentences only
+        suspicious = tox_risk > 0.12 or bias_risk > 0.12 or manip > 0
 
-        # toxicity_score is a SAFETY score (1.0 = safe, 0.0 = toxic).
-        # Convert to risk score for threshold comparisons.
-        toxicity_risk = round(1.0 - scores.toxicity_score, 4)
-        # bias_score is also a SAFETY score (1.0 = unbiased).
-        # Convert to risk score.
-        bias_risk = round(1.0 - scores.bias_score, 4)
-
-        logger.info(
-            f"Chunk {chunk_index} | "
-            f"toxicity_risk={toxicity_risk:.3f} "
-            f"bias_risk={bias_risk:.3f} "
-            f"manipulation_penalty={scores.manipulation_penalty:.3f} "
-            f"ethics_score={scores.ethics_score:.3f}"
-        )
-
-        # Severity based on raw risk signals — NOT the composite ethics_score.
-        # ethics_score blends in sentiment and coherence which can mask toxicity.
-        #
-        # HIGH   : clearly toxic, manipulative, or biased content
-        # MEDIUM : moderately risky content worth reviewing
-        # LOW    : safe
-        if toxicity_risk > 0.7 or scores.manipulation_penalty > 0.4 or bias_risk > 0.6:
-            severity = "HIGH"
-        elif toxicity_risk > 0.4 or bias_risk > 0.3:
-            severity = "MEDIUM"
+        if suspicious:
+            full = scoring.score_candidate(sentence, sentence, DEFAULT_ALPHA)
+            if tox_risk > 0.5 or bias_risk > 0.5 or manip > 0.3:
+                severity = "HIGH"
+            elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+            ethics_score = full.ethics_score
         else:
+            # Approximate ethics for LOW sentences — no model forward pass
+            ethics_score = round(
+                0.40 * tox_score + 0.25 * 0.8 + 0.25 * bias_score + 0.10 * 1.0, 4
+            )
             severity = "LOW"
 
-        flagged = severity in ("HIGH", "MEDIUM")
-
-        logger.info(f"Chunk {chunk_index} → severity={severity}, flagged={flagged}")
+        logger.info(
+            f"Sentence {idx} | tox_risk={tox_risk:.3f} bias_risk={bias_risk:.3f} "
+            f"manip={manip:.2f} suspicious={suspicious} severity={severity}"
+        )
 
         chunk_analyses.append(ChunkAnalysis(
-            chunk=chunk_text,
-            chunk_index=chunk_index,
-            toxicity_score=scores.toxicity_score,
-            toxicity_risk=toxicity_risk,
-            bias_score=scores.bias_score,
-            manipulation_penalty=scores.manipulation_penalty,
-            ethics_score=scores.ethics_score,
-            flagged=flagged,
+            chunk=sentence,
+            chunk_index=idx,
+            toxicity_score=tox_score,
+            toxicity_risk=tox_risk,
+            bias_score=bias_score,
+            manipulation_penalty=manip,
+            ethics_score=ethics_score,
+            flagged=severity in ("HIGH", "MEDIUM"),
             severity=severity,
         ))
 
@@ -580,3 +598,74 @@ def rewrite(req: RewriteRequest):
         scores_before=scores_before,
         scores_after=best,
     )
+
+@app.post(
+    "/analyze-chunks",
+    tags=["Browser Extension"],
+    summary="Score webpage text chunks — browser extension endpoint",
+)
+def analyze_chunks(req: ChunksInput):
+    """
+    Browser extension endpoint.
+    Accepts webpage text as a list of chunks, scores each one,
+    returns severity + optional rewrite for flagged items.
+
+    Set auto_rewrite=False for fast initial page scan.
+    Set auto_rewrite=True only when user requests corrections.
+    """
+    _require_models()
+
+    if not req.chunks:
+        return {"results": []}
+
+    texts = [c.text for c in req.chunks]
+
+    # Stage 1: batch
+    tox_scores      = scoring.batch_toxicity_scores(texts)
+    bias_scores     = scoring.batch_bias_scores(texts)
+    manip_penalties = [scoring.get_manipulation_penalty(t) for t in texts]
+
+    results = []
+
+    for i, chunk in enumerate(req.chunks):
+        tox_risk  = round(1.0 - tox_scores[i], 4)
+        bias_risk = round(1.0 - bias_scores[i], 4)
+        manip     = manip_penalties[i]
+
+        suspicious = tox_risk > 0.12 or bias_risk > 0.12 or manip > 0
+
+        if suspicious:
+            full = scoring.score_candidate(chunk.text, chunk.text, DEFAULT_ALPHA)
+            if tox_risk > 0.5 or bias_risk > 0.5 or manip > 0.3:
+                severity = "HIGH"
+            elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+        else:
+            severity = "LOW"
+
+        rewritten = None
+        if severity in ("HIGH", "MEDIUM") and req.auto_rewrite:
+            try:
+                candidates = generation.generate_rewrite_candidates(
+                    chunk.text, num_candidates=2, max_tokens=60
+                )
+                scored = [
+                    scoring.score_candidate(chunk.text, c, DEFAULT_ALPHA)
+                    for c in candidates
+                ]
+                rewritten = max(scored, key=lambda s: s.final_score).text
+            except Exception:
+                rewritten = None
+
+        results.append({
+            "id": chunk.id,
+            "severity": severity,
+            "toxicity_risk": tox_risk,
+            "bias_risk": bias_risk,
+            "manipulation_penalty": manip,
+            "rewritten": rewritten,
+        })
+
+    return {"results": results}

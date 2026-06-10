@@ -147,6 +147,21 @@ class RewriteResponse(BaseModel):
     scores_after: CandidateScores
 
 
+class WebChunk(BaseModel):
+    """A single text chunk from a webpage, identified by a DOM element ID."""
+    id: str
+    text: str
+
+
+class ChunksInput(BaseModel):
+    """
+    Body for POST /analyze-chunks (browser extension endpoint).
+    auto_rewrite=False for fast initial scan, True when user wants fixes.
+    """
+    chunks: List[WebChunk]
+    auto_rewrite: bool = False
+
+
 class RAGStatusResponse(BaseModel):
     status: str
     total_chunks: int

@@ -81,3 +81,26 @@ def truncate_text(text: str, max_words: int = 200) -> str:
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words]) + " ..."
+
+
+def split_into_sentences(text: str) -> list:
+    """
+    Split text into individual sentences for ethical analysis.
+
+    Used by /analyze-document and the browser extension pipeline.
+    Intentionally separate from chunk_text() which is for RAG retrieval only.
+
+    Splits on sentence-ending punctuation (.!?) followed by whitespace.
+    Filters out fragments shorter than 5 words — these are usually
+    headings, labels, or artifacts from PDF extraction, not real sentences.
+
+    Parameters
+    ----------
+    text : cleaned document text (run through clean_text() first)
+
+    Returns
+    -------
+    List of non-empty sentence strings, each at least 5 words long.
+    """
+    raw = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in raw if s.strip() and len(s.split()) >= 5]
