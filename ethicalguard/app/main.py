@@ -492,7 +492,7 @@ def analyze_document(req: AnalyzeDocumentRequest):
 
         if suspicious:
             full = scoring.score_candidate(sentence, sentence, DEFAULT_ALPHA)
-            if tox_risk > 0.5 or bias_risk > 0.5 or manip > 0.3:
+            if tox_risk > 0.5 or bias_risk > 0.6 or manip > 0.3:
                 severity = "HIGH"
             elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
                 severity = "MEDIUM"
@@ -507,7 +507,8 @@ def analyze_document(req: AnalyzeDocumentRequest):
             severity = "LOW"
 
         logger.info(
-            f"Sentence {idx} | tox_risk={tox_risk:.3f} bias_risk={bias_risk:.3f} "
+            f"Sentence {idx}: {sentence[:120]} | " 
+            f"tox_risk={tox_risk:.3f} bias_risk={bias_risk:.3f} "
             f"manip={manip:.2f} suspicious={suspicious} severity={severity}"
         )
 
@@ -563,6 +564,18 @@ def rewrite(req: RewriteRequest):
     # Score the original text first
     try:
         scores_before = scoring.score_candidate(req.text, req.text, req.alpha)
+        # Already safe → no rewrite needed
+        if (
+            scores_before.ethics_score >= 0.80
+            and scores_before.toxicity_score >= 0.95
+            and scores_before.manipulation_penalty == 0
+        ):
+        return RewriteResponse(
+            original=req.text,
+            ethical_rewrite=req.text,
+            scores_before=scores_before,
+            scores_after=scores_before,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scoring original text failed: {exc}")
 
@@ -636,7 +649,7 @@ def analyze_chunks(req: ChunksInput):
 
         if suspicious:
             full = scoring.score_candidate(chunk.text, chunk.text, DEFAULT_ALPHA)
-            if tox_risk > 0.5 or bias_risk > 0.5 or manip > 0.3:
+            if tox_risk > 0.5 or bias_risk > 0.6 or manip > 0.3:
                 severity = "HIGH"
             elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
                 severity = "MEDIUM"
