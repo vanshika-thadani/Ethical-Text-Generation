@@ -95,28 +95,8 @@ def _build_stop_tokens(tokenizer) -> list[int]:
 
 
 def _get_model_input_device():
-    """
-    Resolve correct input device for generation model.
-
-    With device_map='auto', model.device may be meta, so use hf_device_map.
-    """
-    try:
-        if hasattr(gen_model, "hf_device_map") and gen_model.hf_device_map:
-            devices = list(gen_model.hf_device_map.values())
-            cuda_devs = [
-                d for d in devices
-                if isinstance(d, int) or (isinstance(d, str) and "cuda" in str(d))
-            ]
-            if cuda_devs:
-                d = cuda_devs[0]
-                return f"cuda:{d}" if isinstance(d, int) else d
-
-        for param in gen_model.parameters():
-            if param.device.type != "meta":
-                return param.device
-    except Exception:
-        pass
-
+    if torch.cuda.is_available():
+        return "cuda:0"
     return "cpu"
 
 
@@ -238,13 +218,20 @@ def load_models() -> str:
                 trust_remote_code=True,
             )
 
-            gen_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16 if _device == "cuda" else torch.float32,
-                device_map="auto" if _device == "cuda" else None,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
+            if _device == "cuda":
+                gen_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+            ).cuda()
+            else:
+                gen_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float32,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                )
 
             if _device == "cpu":
                 gen_model = gen_model.to(_device)
