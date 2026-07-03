@@ -86,9 +86,10 @@ INSTRUCTION_PROMPT_TEMPLATE: str = (
 # Plain text — Groq doesn't need Phi-3 native tokens.
 # The {input_text} placeholder is filled by generate_rewrite_candidates().
 REWRITE_PROMPT_TEMPLATE: str = (
-    "Review this sentence. Return it unchanged if it is already ethical. "
-    "Otherwise rewrite it with minimal changes only — preserve the original meaning, "
-    "remove only the harmful/toxic/manipulative/biased elements:\n\n"
+    "Rewrite the following sentence to be completely ethical, unbiased, and factually responsible. "
+    "Check carefully for subtle bias, pseudoscience, harmful generalizations, or stereotypes "
+    "about any group — even if the sentence appears neutral or scientific in tone. "
+    "Always return a rewritten version. Never return the original unchanged.\n\n"
     "{input_text}"
 )
 

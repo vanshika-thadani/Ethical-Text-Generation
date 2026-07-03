@@ -568,6 +568,7 @@ def rewrite(req: RewriteRequest):
         if (
             scores_before.ethics_score >= 0.80
             and scores_before.toxicity_score >= 0.95
+            and scores_before.bias_score >= 0.80 
             and scores_before.manipulation_penalty == 0
         ):
             return RewriteResponse(
