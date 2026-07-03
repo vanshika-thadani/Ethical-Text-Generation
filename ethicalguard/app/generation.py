@@ -3,30 +3,42 @@ generation.py — Model loading and text generation for EthicalGuard.
 
 Responsibilities
 ----------------
-1. Load the generation model (Phi-3-mini-4k-instruct with fallback chain).
-2. Load all scoring models and inject them into scoring.py.
-3. Expose generate_candidates() and generate_one() for use by main.py.
+1. Initialize Groq API client for text generation (Llama-3.3-70B).
+2. Load all local scoring models and inject them into scoring.py.
+3. Expose generate_candidates(), generate_one(), and
+   generate_rewrite_candidates() for use by main.py.
 
-Primary model: microsoft/Phi-3-mini-4k-instruct
-------------------------------------------------
-Phi-3-mini is a 3.8B instruction-tuned model (SFT + DPO + RLHF) that fits
-comfortably on a Colab T4 GPU (~7.5 GB VRAM in float16), leaving enough
-headroom for the scoring models (RoBERTa, SBERT, DistilRoBERTa).
+Why Groq for generation?
+------------------------
+Groq provides fast cloud inference for large models (Llama-3.3-70B),
+replacing local Phi-3-mini. This eliminates GPU VRAM pressure on Colab,
+removes CUDA device placement issues, and dramatically improves output
+quality — especially for the /rewrite endpoint.
 
-Key differences from phi-2 / TinyLlama:
-  - Uses native chat tokens: <|system|>, <|user|>, <|assistant|>, <|end|>
-  - Requires trust_remote_code=True to load
-  - Use max_new_tokens (not max_length) — prompt tokens are long due to
-    the chat template; max_length would leave almost no room for generation
-  - Must include <|end|> in eos_token_id to prevent rambling past the answer
+Why keep distilgpt2 locally?
+-----------------------------
+distilgpt2 (117M params, CPU-friendly) is kept ONLY for fluency scoring
+(perplexity calculation) in scoring.py. The scoring pipeline remains
+fully self-contained and independent of the Groq API — your reranking
+logic owns the evaluation, not an external service.
 
-Fallback chain: Phi-3-mini -> TinyLlama -> distilgpt2
-Each fallback is tried automatically if the previous one fails to load.
+Architecture
+------------
+  Generation:   Groq API (Llama-3.3-70B → llama-3.1-8b-instant fallback)
+  Scoring:      All local on CPU (RoBERTa, DistilRoBERTa, SBERT, distilgpt2)
+
+Fallback strategy
+-----------------
+If the primary Groq model fails, we fall back to llama-3.1-8b-instant
+(still on Groq, lighter model). If Groq is entirely unreachable, the
+server raises a clear RuntimeError at startup.
 """
 
 import logging
+import os
 import re
-import torch
+
+from groq import Groq
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -36,9 +48,6 @@ from transformers import (
 
 from app import scoring
 from app.config import (
-    GEN_MODEL_NAME,
-    GEN_MODEL_FALLBACK,
-    GEN_MODEL_FALLBACK2,
     TOXICITY_MODEL,
     SENTIMENT_MODEL,
     BIAS_MODEL,
@@ -52,70 +61,230 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Device selection
+# Groq config
 # ---------------------------------------------------------------------------
-_device = "cuda" if torch.cuda.is_available() else "cpu"
+GROQ_PRIMARY_MODEL  = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-if torch.cuda.is_available():
-    logger.info(f"CUDA available — device: {torch.cuda.get_device_name(0)}")
-else:
-    logger.info("CUDA not available — running on CPU")
-
-
+# distilgpt2 is used ONLY for fluency/perplexity scoring — NOT for generation.
+FLUENCY_MODEL = "distilgpt2"
 
 # ---------------------------------------------------------------------------
-# Stop token + device helpers
+# Module-level handles
+# ---------------------------------------------------------------------------
+_groq_client: Groq | None = None
+_model_name_loaded: str = ""
+
+# Exposed so main.py can check models are ready (gen_model = distilgpt2)
+gen_tokenizer = None
+gen_model = None
+
+
+# ---------------------------------------------------------------------------
+# Model loading
 # ---------------------------------------------------------------------------
 
-def _build_stop_tokens(tokenizer) -> list[int]:
+def load_models() -> str:
     """
-    Build token IDs that should stop generation.
+    Initialize Groq client and load all local scoring models.
 
-    For Phi-3-mini: includes EOS and <|end|>.
-    For TinyLlama / distilgpt2: usually only EOS is needed.
+    Returns the Groq model name that will be used for generation.
+    Raises RuntimeError if GROQ_API_KEY is missing or connectivity fails.
     """
-    stop = []
+    global _groq_client, _model_name_loaded, gen_tokenizer, gen_model
 
-    if tokenizer.eos_token_id is not None:
-        stop.append(tokenizer.eos_token_id)
+    # ── 1. Groq client ───────────────────────────────────────────────────────
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY environment variable not set. "
+            "Get a free key at https://console.groq.com and run: "
+            "export GROQ_API_KEY=your_key_here"
+        )
 
+    _groq_client = Groq(api_key=api_key)
+
+    # Verify connectivity with a minimal test call
+    active_model = None
+    for model in [GROQ_PRIMARY_MODEL, GROQ_FALLBACK_MODEL]:
+        try:
+            _groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=5,
+            )
+            active_model = model
+            logger.info(f"Groq client ready. Using model: {model}")
+            break
+        except Exception as exc:
+            logger.warning(f"Groq model {model} unreachable: {exc}")
+
+    if active_model is None:
+        raise RuntimeError(
+            "Groq API unreachable for all models. "
+            "Check your GROQ_API_KEY and network connectivity."
+        )
+    _model_name_loaded = active_model
+
+    # ── 2. distilgpt2 — fluency/perplexity scoring only ─────────────────────
+    logger.info(f"Loading fluency model: {FLUENCY_MODEL} (CPU, for perplexity scoring only)...")
     try:
-        end_id = tokenizer.convert_tokens_to_ids("<|end|>")
-        if (
-            end_id is not None
-            and end_id != tokenizer.unk_token_id
-            and end_id not in stop
-        ):
-            stop.append(end_id)
-            logger.info(f"Added <|end|> (id={end_id}) to stop tokens.")
-    except Exception:
-        pass
+        gen_tokenizer = AutoTokenizer.from_pretrained(FLUENCY_MODEL)
+        gen_model = AutoModelForCausalLM.from_pretrained(FLUENCY_MODEL)
+        if gen_tokenizer.pad_token is None:
+            gen_tokenizer.pad_token = gen_tokenizer.eos_token
+        logger.info(f"Fluency model loaded: {FLUENCY_MODEL} | device: cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load fluency model ({FLUENCY_MODEL}): {exc}")
 
-    return stop
+    # ── 3. Toxicity model (local CPU) ────────────────────────────────────────
+    logger.info(f"Loading toxicity model: {TOXICITY_MODEL} on CPU ...")
+    try:
+        reward_tokenizer = AutoTokenizer.from_pretrained(TOXICITY_MODEL)
+        reward_model = AutoModelForSequenceClassification.from_pretrained(
+            TOXICITY_MODEL
+        ).to("cpu")
+        logger.info("Toxicity model device: cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load toxicity model ({TOXICITY_MODEL}): {exc}")
 
+    # ── 4. Sentiment model (local CPU) ───────────────────────────────────────
+    logger.info(f"Loading sentiment model: {SENTIMENT_MODEL} on CPU ...")
+    try:
+        sentiment_pipe = pipeline(
+            "sentiment-analysis",
+            model=SENTIMENT_MODEL,
+            truncation=True,
+            max_length=512,
+            device=-1,
+        )
+        logger.info("Sentiment pipeline device: cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load sentiment model ({SENTIMENT_MODEL}): {exc}")
 
-def _get_model_input_device():
-    if torch.cuda.is_available():
-        return "cuda:0"
-    return "cpu"
+    # ── 5. Bias model (local CPU) ────────────────────────────────────────────
+    logger.info(f"Loading bias model: {BIAS_MODEL} on CPU ...")
+    try:
+        bias_pipe = pipeline(
+            "text-classification",
+            model=BIAS_MODEL,
+            truncation=True,
+            max_length=512,
+            device=-1,
+        )
+        logger.info("Bias pipeline device: cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load bias model ({BIAS_MODEL}): {exc}")
+
+    # ── 6. Inject all handles into scoring.py ────────────────────────────────
+    # gen_tokenizer/gen_model → distilgpt2, used ONLY for fluency scoring.
+    # Generation itself happens via Groq API — scoring.py never calls Groq.
+    scoring.set_scoring_models(
+        reward_tokenizer=reward_tokenizer,
+        reward_model=reward_model,
+        sentiment_pipe=sentiment_pipe,
+        bias_pipe=bias_pipe,
+        gen_tokenizer=gen_tokenizer,
+        gen_model=gen_model,
+    )
+
+    # ── 7. Share SBERT with rag.py and init vector DB ────────────────────────
+    from app import rag
+    rag.set_rag_sbert_model(scoring._sbert_model)
+    rag.init_vector_db()
+
+    logger.info(f"All models loaded. Generation: Groq/{_model_name_loaded} | Scoring: local CPU")
+    return _model_name_loaded
 
 
 # ---------------------------------------------------------------------------
-# Sentence truncator — clips rambling output to the first complete sentence
+# Text generation via Groq API
+# ---------------------------------------------------------------------------
+
+def generate_one(prompt: str, max_tokens: int) -> str:
+    """
+    Generate a single completion for the given prompt via Groq API.
+
+    Uses a clean system message (no Phi-3 chat tokens — those were specific
+    to the local model format). The INSTRUCTION_PROMPT_TEMPLATE is used as
+    the user message content.
+
+    Falls back to GROQ_FALLBACK_MODEL if the active model fails.
+    """
+    if _groq_client is None:
+        raise RuntimeError("Groq client not initialized. Call load_models() first.")
+
+    system_msg = (
+        "You are a helpful, respectful, and ethical AI assistant. "
+        "Produce safe, unbiased, non-toxic responses. "
+        "Be concise and direct. Avoid harmful, manipulative, or biased language."
+    )
+
+    # Strip Phi-3 tokens from the template — Groq chat API doesn't need them.
+    # The template still injects the prompt cleanly as a user turn.
+    user_content = INSTRUCTION_PROMPT_TEMPLATE.format(prompt=prompt)
+    # Remove any <|system|> / <|user|> / <|assistant|> / <|end|> artifacts
+    user_content = re.sub(r"<\|[^|]+\|>", "", user_content).strip()
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user",   "content": user_content},
+    ]
+
+    for model in [_model_name_loaded, GROQ_FALLBACK_MODEL]:
+        try:
+            response = _groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+                top_p=0.9,
+            )
+            text = response.choices[0].message.content.strip()
+            if text:
+                return text
+            logger.warning(f"generate_one(): empty response from {model}, trying fallback.")
+        except Exception as exc:
+            logger.warning(f"Groq generation failed ({model}): {exc}")
+
+    logger.warning("All Groq models failed — returning fallback text.")
+    return EMPTY_OUTPUT_FALLBACK
+
+
+def generate_candidates(prompt: str, num_candidates: int, max_tokens: int) -> list[str]:
+    """
+    Generate num_candidates non-empty completions for the prompt via Groq.
+
+    Temperature sampling ensures diversity across candidates so the ethical
+    reranker has meaningful choices to score.
+    """
+    MAX_RETRIES = num_candidates * 3
+    results: list[str] = []
+    attempts = 0
+
+    while len(results) < num_candidates and attempts < MAX_RETRIES:
+        candidate = generate_one(prompt, max_tokens)
+        attempts += 1
+        if candidate.strip():
+            results.append(candidate)
+        else:
+            logger.warning(f"Skipping empty candidate (attempt {attempts})")
+
+    while len(results) < num_candidates:
+        logger.warning("Padding candidates with fallback text after max retries.")
+        results.append(EMPTY_OUTPUT_FALLBACK)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Rewrite-specific generation (used ONLY by /rewrite endpoint)
 # ---------------------------------------------------------------------------
 
 def _truncate_to_first_sentence(text: str) -> str:
     """
     Return the first complete sentence from text.
-
-    Phi-3 occasionally generates multiple sentences despite instructions.
-    This clips everything after the first sentence-ending punctuation,
-    provided the result is at least 3 words long (not a fragment).
-
-    Examples:
-      "I hope we can resolve this. Please note that..." -> "I hope we can resolve this."
-      "I feel hurt." -> "I feel hurt."
-      "Okay." -> unchanged (too short to be a meaningful rewrite)
+    Prevents LLMs from appending extra commentary after the rewrite.
     """
     match = re.match(r'^([^.!?]*[.!?])', text)
     if match:
@@ -125,22 +294,15 @@ def _truncate_to_first_sentence(text: str) -> str:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Rewrite candidate validation
-# ---------------------------------------------------------------------------
-
 def is_valid_rewrite_candidate(text: str, original: str = "") -> bool:
     """
-    Validate a rewrite candidate.
-
-    Rejects if ANY of these are true:
-      1. Empty or whitespace-only
-      2. Fewer than 5 characters
-      3. Fewer than 3 words
-      4. No alphabetic characters
-      5. Ends with a colon (label, not a sentence)
-      6. Starts with a meta-prefix (model narrating instead of rewriting)
-      7. Identical to the original input (no rewrite happened)
+    Validate a rewrite candidate. Rejects outputs that are:
+      1. Empty / too short (< 5 chars or < 3 words)
+      2. Pure punctuation / no letters
+      3. Ends with a colon (label, not a sentence)
+      4. Starts with meta-commentary ("Here is a rewrite:", etc.)
+      5. Identical to the original input (no rewrite happened)
+    Logs rejection reason for debugging.
     """
     if not text:
         logger.warning("Rejected rewrite: empty string")
@@ -156,9 +318,8 @@ def is_valid_rewrite_candidate(text: str, original: str = "") -> bool:
         logger.warning(f"Rejected rewrite (no letters): {repr(stripped)}")
         return False
 
-    words = stripped.split()
-    if len(words) < 3:
-        logger.warning(f"Rejected rewrite (only {len(words)} words): {repr(stripped)}")
+    if len(stripped.split()) < 3:
+        logger.warning(f"Rejected rewrite (< 3 words): {repr(stripped)}")
         return False
 
     if stripped.endswith(":"):
@@ -186,280 +347,70 @@ def is_valid_rewrite_candidate(text: str, original: str = "") -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Module-level handles (set during load_models())
-# ---------------------------------------------------------------------------
-gen_tokenizer = None
-gen_model = None
-_model_name_loaded: str = ""
-_stop_tokens: list = []
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_models() -> str:
+def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens: int) -> list[str]:
     """
-    Load all models required by EthicalGuard and wire them into scoring.py.
+    Generate rewrite candidates via Groq using REWRITE_PROMPT_TEMPLATE.
 
-    Returns the name of the generation model that was successfully loaded.
-    Raises RuntimeError if even the fallback model fails.
-    """
-    global gen_tokenizer, gen_model, _model_name_loaded, _stop_tokens
-
-    # ── 1. Generation model (Phi-3-mini -> TinyLlama -> distilgpt2) ─────────
-    for model_id in [GEN_MODEL_NAME, GEN_MODEL_FALLBACK, GEN_MODEL_FALLBACK2]:
-        try:
-            logger.info(f"Loading generation model: {model_id} on {_device} ...")
-
-            gen_tokenizer = AutoTokenizer.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-            )
-
-            if _device == "cuda":
-                gen_model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.float16,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-            ).cuda()
-            else:
-                gen_model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.float32,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                )
-
-            if _device == "cpu":
-                gen_model = gen_model.to(_device)
-
-            if gen_tokenizer.pad_token is None:
-                gen_tokenizer.pad_token = gen_tokenizer.eos_token
-
-            _stop_tokens = _build_stop_tokens(gen_tokenizer)
-            logger.info(f"Stop tokens: {_stop_tokens}")
-
-            _model_name_loaded = model_id
-            logger.info(
-                f"Generation model loaded: {model_id} | "
-                f"device: {next(gen_model.parameters()).device}"
-            )
-            break
-
-        except Exception as exc:
-            logger.warning(f"Failed to load {model_id}: {exc}")
-            if model_id == GEN_MODEL_FALLBACK2:
-                raise RuntimeError(
-                    f"Could not load any generation model. "
-                    f"Tried: {GEN_MODEL_NAME}, {GEN_MODEL_FALLBACK}, {GEN_MODEL_FALLBACK2}. "
-                    f"Last error: {exc}"
-                )
-
-    # ── 2. Toxicity model — force CPU to save GPU memory for generation ────
-    logger.info(f"Loading toxicity model: {TOXICITY_MODEL} on CPU ...")
-    try:
-        reward_tokenizer = AutoTokenizer.from_pretrained(TOXICITY_MODEL)
-        reward_model = AutoModelForSequenceClassification.from_pretrained(
-            TOXICITY_MODEL
-        ).to("cpu")   # explicitly on CPU — keeps VRAM free for Phi-3
-        logger.info(f"Toxicity model device: cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load toxicity model ({TOXICITY_MODEL}): {exc}")
-
-    # ── 3. Sentiment model — force CPU (device=-1 in pipeline) ──────────────
-    logger.info(f"Loading sentiment model: {SENTIMENT_MODEL} on CPU ...")
-    try:
-        sentiment_pipe = pipeline(
-            "sentiment-analysis",
-            model=SENTIMENT_MODEL,
-            truncation=True,
-            max_length=512,
-            device=-1,   # -1 = CPU, regardless of CUDA availability
-        )
-        logger.info(f"Sentiment pipeline device: cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load sentiment model ({SENTIMENT_MODEL}): {exc}")
-
-    # ── 4. Bias model — force CPU (device=-1 in pipeline) ───────────────────
-    logger.info(f"Loading bias model: {BIAS_MODEL} on CPU ...")
-    try:
-        bias_pipe = pipeline(
-            "text-classification",
-            model=BIAS_MODEL,
-            truncation=True,
-            max_length=512,
-            device=-1,   # -1 = CPU
-        )
-        logger.info(f"Bias pipeline device: cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load bias model ({BIAS_MODEL}): {exc}")
-
-    # ── 5. Inject all handles into scoring.py ────────────────────────────────
-    scoring.set_scoring_models(
-        reward_tokenizer=reward_tokenizer,
-        reward_model=reward_model,
-        sentiment_pipe=sentiment_pipe,
-        bias_pipe=bias_pipe,
-        gen_tokenizer=gen_tokenizer,
-        gen_model=gen_model,
-    )
-
-    # ── 6. Share SBERT with rag.py and init vector DB ────────────────────────
-    from app import rag
-    rag.set_rag_sbert_model(scoring._sbert_model)
-    rag.init_vector_db()
-
-    logger.info("All models loaded successfully.")
-    return _model_name_loaded
-
-
-# ---------------------------------------------------------------------------
-# Text generation helpers
-# ---------------------------------------------------------------------------
-
-def generate_one(prompt: str, max_tokens: int) -> str:
-    """
-    Generate a single completion for the given prompt.
-
-    INSTRUCTION_PROMPT_TEMPLATE already contains Phi-3 chat tokens.
-    Do NOT apply apply_chat_template on top — that would double-format.
-    """
-    formatted = INSTRUCTION_PROMPT_TEMPLATE.format(prompt=prompt)
-
-    inputs = gen_tokenizer(formatted, return_tensors="pt")
-    input_device = _get_model_input_device()
-    inputs = {k: v.to(input_device) for k, v in inputs.items()}
-
-    output = gen_model.generate(
-        **inputs,
-        max_new_tokens=max_tokens,
-        do_sample=True,
-        temperature=0.7,
-        top_k=40,
-        top_p=0.9,
-        repetition_penalty=1.3,
-        no_repeat_ngram_size=3,
-        pad_token_id=gen_tokenizer.eos_token_id,
-        eos_token_id=_stop_tokens,
-    )
-
-    input_len = inputs["input_ids"].shape[1]
-    generated_ids = output[0][input_len:]
-    text = gen_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    if not text:
-        logger.warning("generate_one() produced empty output — using fallback text.")
-        return EMPTY_OUTPUT_FALLBACK
-
-    return text
-
-
-def generate_candidates(prompt: str, num_candidates: int, max_tokens: int) -> list:
-    """
-    Generate num_candidates non-empty completions for the prompt.
-    Each call uses stochastic sampling so outputs differ.
-    Logs CUDA memory before/after generation for OOM diagnosis.
-    """
-    if _device == "cuda":
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        logger.info(
-            f"generate_candidates() start — CUDA memory: "
-            f"allocated={alloc:.2f}GB reserved={reserved:.2f}GB"
-        )
-
-    MAX_RETRIES = num_candidates * 3
-    results = []
-    attempts = 0
-
-    while len(results) < num_candidates and attempts < MAX_RETRIES:
-        candidate = generate_one(prompt, max_tokens)
-        attempts += 1
-        if candidate.strip():
-            results.append(candidate)
-        else:
-            logger.warning(f"Skipping empty candidate (attempt {attempts})")
-
-    while len(results) < num_candidates:
-        logger.warning("Padding candidates with fallback text after max retries.")
-        results.append(EMPTY_OUTPUT_FALLBACK)
-
-    if _device == "cuda":
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        logger.info(
-            f"generate_candidates() end — CUDA memory: "
-            f"allocated={alloc:.2f}GB reserved={reserved:.2f}GB"
-        )
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Rewrite-specific generation (used ONLY by /rewrite endpoint)
-# ---------------------------------------------------------------------------
-
-def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens: int) -> list:
-    """
-    Generate rewrite candidates using REWRITE_PROMPT_TEMPLATE.
-
-    REWRITE_PROMPT_TEMPLATE already uses Phi-3 chat tokens.
-    Do NOT apply apply_chat_template on top.
+    With Llama-3.3-70B, the rewrite prompt works much better than with
+    Phi-3 — the model reliably returns one clean sentence without the
+    meta-commentary issues that plagued the local model.
 
     Post-processing pipeline per raw output:
-      1. Strip known output prefixes
-      2. Strip "Output (in English):" style prefixes
-      3. Remove surrounding quotes
-      4. Remove markdown bullets
-      5. Take first non-empty line
-      5b. Truncate to first sentence (fixes Phi-3 rambling)
-      6. Final strip
-      7. Validate with is_valid_rewrite_candidate()
+      1. Strip known output prefixes ("Rewrite:", "Output:", etc.)
+      2. Remove surrounding quotes
+      3. Remove markdown bullets
+      4. Take the first non-empty line
+      5. Truncate to first sentence (catches any trailing commentary)
+      6. Validate with is_valid_rewrite_candidate()
 
-    Only candidates passing validation are kept.
     Raises ValueError if no valid candidate after MAX_RETRIES.
     """
-    # Use REWRITE_MAX_TOKENS cap regardless of what caller passes in,
-    # since the prompt already enforces "max 20 words" — extra tokens
-    # just give the model room to ramble.
+    if _groq_client is None:
+        raise RuntimeError("Groq client not initialized.")
+
     effective_max_tokens = min(max_tokens, REWRITE_MAX_TOKENS)
 
-    formatted = REWRITE_PROMPT_TEMPLATE.format(input_text=input_text)
+    # Build a clean rewrite system message for Groq (strip Phi-3 tokens from template)
+    rewrite_system = (
+        "You are an ethical AI rewriting assistant. "
+        "Your task is to minimally edit unsafe text. "
+        "If the sentence is already ethical, return it unchanged. "
+        "If rewriting is needed, preserve the original meaning with the smallest possible edit. "
+        "Output ONLY one final sentence. No quotes. No explanation. No labels."
+    )
 
-    results = []
-    MAX_RETRIES = num_candidates * 5
+    # Strip Phi-3 chat tokens from REWRITE_PROMPT_TEMPLATE — Groq doesn't need them.
+    user_content = REWRITE_PROMPT_TEMPLATE.format(input_text=input_text)
+    user_content = re.sub(r"<\|[^|]+\|>", "", user_content).strip()
+
+    messages = [
+        {"role": "system", "content": rewrite_system},
+        {"role": "user",   "content": user_content},
+    ]
+
+    results: list[str] = []
+    MAX_RETRIES = num_candidates * 3   # Groq is fast — fewer retries needed
 
     for attempt in range(MAX_RETRIES):
         if len(results) >= num_candidates:
             break
 
-        inputs = gen_tokenizer(formatted, return_tensors="pt")
-        input_device = _get_model_input_device()
-        inputs = {k: v.to(input_device) for k, v in inputs.items()}
+        try:
+            response = _groq_client.chat.completions.create(
+                model=_model_name_loaded,
+                messages=messages,
+                max_tokens=effective_max_tokens,
+                temperature=0.5,   # lower temp for more focused rewrites
+                top_p=0.9,
+            )
+            raw = response.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.warning(f"Groq rewrite attempt {attempt + 1} failed: {exc}")
+            continue
 
-        output = gen_model.generate(
-            **inputs,
-            max_new_tokens=effective_max_tokens,
-            do_sample=True,
-            temperature=0.6,
-            top_k=40,
-            top_p=0.9,
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=3,
-            pad_token_id=gen_tokenizer.eos_token_id,
-            eos_token_id=_stop_tokens,
-        )
-
-        input_len = inputs["input_ids"].shape[1]
-        generated_ids = output[0][input_len:]
-        raw = gen_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        logger.debug(f"Rewrite attempt {attempt + 1} raw output: {repr(raw)}")
+        logger.debug(f"Rewrite attempt {attempt + 1} raw: {repr(raw)}")
 
         # ── Post-processing ──────────────────────────────────────────────
-
         cleaned = raw
 
         # 1. Strip known output prefixes
@@ -467,43 +418,30 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
             if cleaned.lower().startswith(prefix.lower()):
                 cleaned = cleaned[len(prefix):].strip()
 
-        # 2. Strip "Output (in English):" style prefixes
-        cleaned = re.sub(r"(?i)^output\s*\([^)]*\)\s*:\s*", "", cleaned).strip()
-
-        # 3. Remove surrounding quotes
+        # 2. Remove surrounding quotes
         cleaned = cleaned.strip('"\'').strip()
-        if cleaned.startswith('\\"') and cleaned.endswith('\\"'):
-            cleaned = cleaned[2:-2].strip()
 
-        # 4. Remove markdown bullets
+        # 3. Remove markdown bullets
         cleaned = re.sub(r"^[\-\*\•]\s*", "", cleaned)
 
-        # 5. Take first non-empty line
+        # 4. First non-empty line only
         lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
         cleaned = lines[0] if lines else ""
 
-        # 5b. Truncate to first sentence — fixes Phi-3 rambling past
-        #     the answer even when max_new_tokens is respected.
-        #     "I hope we resolve this. Please note that complex..." -> "I hope we resolve this."
+        # 5. Truncate to first sentence
         cleaned = _truncate_to_first_sentence(cleaned)
-
-        # 6. Final strip
         cleaned = cleaned.strip()
 
         logger.debug(f"Rewrite attempt {attempt + 1} cleaned: {repr(cleaned)}")
 
-        # 7. Validate
         if is_valid_rewrite_candidate(cleaned, original=input_text):
             results.append(cleaned)
         else:
-            logger.warning(
-                f"Rejected invalid rewrite candidate (attempt {attempt + 1}): {repr(cleaned)}"
-            )
+            logger.warning(f"Rejected rewrite candidate (attempt {attempt + 1}): {repr(cleaned)}")
 
     if not results:
         raise ValueError(
-            "Could not generate a valid rewrite. "
-            "The model produced only invalid outputs after multiple attempts. "
+            "Could not generate a valid rewrite after multiple attempts. "
             "Please try again."
         )
 
@@ -514,10 +452,10 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
 # Browser-extension preparation helpers
 # ---------------------------------------------------------------------------
 
-def analyze_webpage_text(text: str) -> list:
+def analyze_webpage_text(text: str) -> list[str]:
     """
-    Prepare webpage text for ethical analysis.
-    Splits into sentence-level chunks suitable for scoring.
+    Split webpage text into sentence-level chunks for ethical analysis.
+    Used by the /analyze-chunks endpoint (browser extension).
     """
     from app.utils import chunk_text, clean_text
     cleaned = clean_text(text)
@@ -526,13 +464,14 @@ def analyze_webpage_text(text: str) -> list:
 
 def rewrite_webpage_chunk(chunk: str, max_tokens: int = 60) -> str:
     """
-    Rewrite a single webpage text chunk into a safer version.
+    Rewrite a single webpage chunk into a safer version via Groq.
     Returns the best rewrite candidate (highest final_score).
+    Used by the /analyze-chunks endpoint (browser extension).
     """
     from app import scoring
     from app.config import DEFAULT_ALPHA
 
-    candidates = generate_rewrite_candidates(chunk, num_candidates=3, max_tokens=max_tokens)
+    candidates = generate_rewrite_candidates(chunk, num_candidates=2, max_tokens=max_tokens)
     scored = [scoring.score_candidate(chunk, c, DEFAULT_ALPHA) for c in candidates]
     best = max(scored, key=lambda s: s.final_score)
     return best.text

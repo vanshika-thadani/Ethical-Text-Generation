@@ -12,9 +12,15 @@ import os
 # ---------------------------------------------------------------------------
 # Generation model
 # ---------------------------------------------------------------------------
-GEN_MODEL_NAME: str = os.getenv("GEN_MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
-GEN_MODEL_FALLBACK: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-GEN_MODEL_FALLBACK2: str = "distilgpt2"
+# Generation is handled by Groq API (Llama-3.3-70B).
+# The model name is set in generation.py via the GROQ_MODEL env var.
+# GEN_MODEL_NAME is kept here only for backwards-compat references.
+# distilgpt2 is still loaded locally for fluency/perplexity scoring only.
+#
+# Set your API key before starting the server:
+#   export GROQ_API_KEY=your_key_here   # Linux/macOS/Colab
+#   set GROQ_API_KEY=your_key_here      # Windows
+GEN_MODEL_NAME: str = "groq/llama-3.3-70b-versatile"   # informational only
 
 # ---------------------------------------------------------------------------
 # Safety / scoring models
@@ -66,36 +72,24 @@ DEFAULT_ALPHA: float = 0.7
 # ---------------------------------------------------------------------------
 # Instruction prompt wrapper (used by /generate and /ask)
 # ---------------------------------------------------------------------------
+# Plain text template — no Phi-3 chat tokens needed with Groq API.
+# The {prompt} placeholder is filled by generation.py before calling Groq.
 INSTRUCTION_PROMPT_TEMPLATE: str = (
-    "<|system|>\n"
-    "You are EthicalGuard, an AI safety and content analysis assistant. "
-    "Respond in a factual, neutral, and informative way. "
-    "Identify ethical issues, biases, or unsafe patterns if present.<|end|>\n"
-    "<|user|>\n"
-    "{prompt}<|end|>\n"
-    "<|assistant|>\n"
+    "Analyze the following content and respond in a factual, neutral, and informative way. "
+    "Identify any ethical issues, biases, or unsafe patterns if present.\n\n"
+    "{prompt}"
 )
 
 # ---------------------------------------------------------------------------
 # Rewrite-specific prompt (used ONLY by /rewrite endpoint)
 # ---------------------------------------------------------------------------
-# Explicit "one sentence, max 20 words" constraint stops Phi-3 from rambling.
-# The constraint is stated twice (system + user) for emphasis.
+# Plain text — Groq doesn't need Phi-3 native tokens.
+# The {input_text} placeholder is filled by generate_rewrite_candidates().
 REWRITE_PROMPT_TEMPLATE: str = (
-    "<|system|>\n"
-    "You are an ethical AI rewriting assistant. "
-    "Your job is to minimally edit unsafe text, not to create new content. "
-    "First decide whether the sentence actually contains toxicity, bias, manipulation, threats, coercion, or harmful stereotypes. "
-    "If the sentence is already ethical, fair, and non-manipulative, return it unchanged. "
-    "If rewriting is needed, preserve the original meaning and make the smallest possible edit. "
-    "Do not add new facts, examples, identities, groups, topics, explanations, or assumptions. "
-    "Do not expand the sentence. "
-    "Output ONLY one final sentence. No quotes. No explanation.<|end|>\n"
-    "<|user|>\n"
     "Review this sentence. Return it unchanged if it is already ethical. "
-    "Otherwise rewrite it with minimal changes only:\n\n"
-    "{input_text}<|end|>\n"
-    "<|assistant|>\n"
+    "Otherwise rewrite it with minimal changes only — preserve the original meaning, "
+    "remove only the harmful/toxic/manipulative/biased elements:\n\n"
+    "{input_text}"
 )
 
 # Prefixes stripped from model output in post-processing.
