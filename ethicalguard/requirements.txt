@@ -1,26 +1,28 @@
 # EthicalGuard — Python dependencies
 #
-# On Colab: install only what's missing, let Colab's environment handle
-# the rest. Do NOT use exact pins (==) on Colab — they conflict with
-# pre-installed packages like gradio, google-adk, langchain.
+# RAM profile on Render free tier (512MB):
+#   distilgpt2 (fluency):  ~250MB  (local)
+#   SBERT all-MiniLM:       ~90MB  (local)
+#   Toxicity/Sentiment/Bias: 0MB   (HF Inference API)
+#   Total:                 ~340MB  ✅ fits free tier
 #
-# Install command for Colab:
-#   pip install -r requirements.txt -q
-#   pip install groq -q
+# API keys required (set as environment variables):
+#   GROQ_API_KEY  — https://console.groq.com
+#   HF_API_KEY    — https://huggingface.co/settings/tokens
 
 # --- API framework ---
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 
-# --- Core ML ---
+# --- Core ML (local models only: distilgpt2 + SBERT) ---
 torch>=2.0.0
-transformers>=4.40.0        # Phi-3 requires >=4.40; kept for tokenizers/pipelines
-accelerate>=0.30.0
+transformers>=4.40.0
 sentence-transformers>=2.7.0
 
-# --- Generation API ---
-groq                        # Groq API client for Llama-3.3-70B generation
+# --- API clients ---
+groq                   # Groq API for Llama-3.3-70B generation
+requests>=2.32.0       # HF Inference API HTTP calls (already in stdlib-adjacent)
 
 # --- Vector DB ---
 faiss-cpu
@@ -32,4 +34,3 @@ PyPDF2>=3.0.1
 # --- Data / validation ---
 pydantic>=2.7.0
 numpy
-requests>=2.32.0

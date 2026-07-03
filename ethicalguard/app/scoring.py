@@ -1,275 +1,227 @@
 """
 scoring.py — All safety and quality scoring logic for EthicalGuard.
 
-Design principle: score_candidate() is the single entry point.
-It computes every metric once and returns a CandidateScores object.
-No other module should call individual scoring helpers directly —
-always go through score_candidate() to avoid redundant computation.
+Architecture after HF migration
+---------------------------------
+  Toxicity, Sentiment, Bias  → HF Inference API (zero local RAM)
+  Coherence                  → SBERT local CPU (~90MB)
+  Fluency                    → distilgpt2 local CPU (~250MB)
+  Manipulation penalty       → string matching (no model)
 
-Metrics explained
------------------
-toxicity_score  : How hate-speech-free the text is (1 = safe).
-                  Uses a RoBERTa model fine-tuned on the DynaBench hate-speech
-                  dataset.  We take the probability of the "non-hate" class.
+  Total local RAM: ~340MB  ✅ fits Render free tier (512MB)
 
-sentiment_score : Penalises strongly negative tone.
-                  Uses a Twitter-trained RoBERTa sentiment model.
-                  Positive → ~1.0, Neutral → 0.8, Negative → 0.5–0.75.
+Why keep SBERT and distilgpt2 local?
+  SBERT is needed synchronously for every RAG embed call — API latency
+  would make document upload/retrieval unusably slow.
+  distilgpt2 is 250MB and used only for perplexity — not worth an API call.
 
-bias_score      : How free the text is from stereotyped / prejudiced language.
-                  Uses a DistilRoBERTa model trained on the MBIC bias corpus.
-                  1.0 = unbiased, 0.0 = strongly biased.
-
-coherence_score : Semantic similarity between prompt and response.
-                  Computed with SBERT cosine similarity.
-                  High score means the response actually addresses the prompt.
-
-ethics_score    : Weighted composite of the four scores above.
-                  Weights are defined in config.py.
-
-fluency_score   : Perplexity-based naturalness score.
-                  Lower perplexity → more natural text → higher score.
-                  We reuse the generation model already in memory — no extra
-                  download needed.
-
-manipulation_penalty : Deducted from the final score when the text contains
-                       known manipulation trigger phrases (see config.py).
-
-final_score     : alpha * ethics_score + (1 - alpha) * fluency_score
-                  - manipulation_penalty
-                  Higher is better.  alpha controls the ethics/fluency trade-off.
+HF Inference API notes
+  - Free tier allows ~1000 requests/day per model.
+  - Each scoring call = 3 API requests (toxicity + sentiment + bias).
+  - Models warm up on first call (~10-20s cold start on free tier).
+  - Responses are deterministic (no sampling) — consistent scores.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import time
 import torch
+import requests as _http
+
 from sentence_transformers import SentenceTransformer, util
 from app.config import (
     WEIGHT_TOXICITY, WEIGHT_SENTIMENT, WEIGHT_BIAS, WEIGHT_COHERENCE,
     MANIPULATION_TRIGGERS, MANIPULATION_PENALTY_PER_WORD, MANIPULATION_PENALTY_MAX,
     SBERT_MODEL, EMPTY_OUTPUT_FALLBACK,
+    TOXICITY_MODEL, SENTIMENT_MODEL, BIAS_MODEL,
 )
 from app.models import CandidateScores
-
-
-# ---------------------------------------------------------------------------
-# Module-level model handles (populated by generation.py after model load)
-# ---------------------------------------------------------------------------
-# We store references here so scoring.py never imports generation.py
-# (which would create a circular dependency).  generation.py calls
-# scoring.set_gen_model() once after its own models are ready.
-
-_reward_tokenizer = None
-_reward_model = None
-_sentiment_pipeline = None
-_bias_pipeline = None
-_sbert_model = None  # type: SentenceTransformer | None
-_gen_tokenizer = None
-_gen_model = None
-
-# Resolved at startup: index of the safe (non-toxic) class in the toxicity model's output.
-# Never assume a fixed index — different model checkpoints use different label orders.
-_safe_label_index: int = 0
-
-
-# Keywords used to identify which labels are "safe" vs "unsafe" in the toxicity model.
-# Safe labels: nothate, non-hate, not hate, normal, neutral
-# Unsafe labels: hate, toxic, offensive, abusive
-_SAFE_LABEL_KEYWORDS = {"nothate", "non-hate", "not hate", "normal", "neutral"}
-_UNSAFE_LABEL_KEYWORDS = {"hate", "toxic", "offensive", "abusive"}
-
 
 import logging as _logging
 _logger = _logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level handles
+# ---------------------------------------------------------------------------
+_hf_api_key: str = ""
+_sbert_model: SentenceTransformer | None = None
+_gen_tokenizer = None
+_gen_model = None
+
+# HF Inference API base URL
+_HF_API_BASE = "https://api-inference.huggingface.co/models"
 
 # ---------------------------------------------------------------------------
 # NaN / Inf safety helper
 # ---------------------------------------------------------------------------
 
 def safe_float(value: object, default: float = 0.0, label: str = "") -> float:
-    """
-    Convert a raw score to a JSON-safe float.
-
-    Returns `default` (0.0) if the value is:
-      - None
-      - NaN  (can occur when a model returns degenerate logits)
-      - Inf  (can occur from log(0) or division by zero in perplexity)
-
-    Logs a warning whenever a replacement is made so the root cause can be
-    investigated without crashing the API.
-    """
+    """Return a JSON-safe float, substituting `default` for None/NaN/Inf."""
     try:
         v = float(value)
     except (TypeError, ValueError):
-        _logger.warning(f"safe_float: could not convert {label!r} value {value!r} → using {default}")
+        _logger.warning(f"safe_float: cannot convert {label!r}={value!r} → {default}")
         return default
-
     if math.isnan(v) or math.isinf(v):
-        _logger.warning(f"safe_float: {label!r} is {'NaN' if math.isnan(v) else 'Inf'} → replacing with {default}")
+        _logger.warning(f"safe_float: {label!r} is NaN/Inf → {default}")
         return default
-
     return round(v, 4)
 
 
-def _resolve_safe_label_index(model) -> int:
+# ---------------------------------------------------------------------------
+# Startup injection
+# ---------------------------------------------------------------------------
+
+def set_scoring_models(hf_api_key: str, gen_tokenizer, gen_model):
     """
-    Inspect model.config.id2label to find which output index corresponds
-    to the safe / non-toxic class.
+    Called once at startup by generation.py.
 
-    Logic:
-      - If a label contains any SAFE keyword  → treat as safe index.
-      - If a label contains any UNSAFE keyword → treat as unsafe index.
-      - If neither matches, fall back to index 0 and log a warning.
+    Stores the HF API key, loads SBERT locally, and stores the distilgpt2
+    handles for fluency scoring.
 
-    Logs the full id2label map once at startup so label order is always
-    visible in the server logs for debugging.
+    No local model objects for toxicity/sentiment/bias — those go through
+    the HF Inference API using _hf_api_key.
     """
-    id2label = model.config.id2label  # e.g. {0: 'nothate', 1: 'hate'}
-    _logger.info(f"Toxicity model id2label: {id2label}")
+    global _hf_api_key, _sbert_model, _gen_tokenizer, _gen_model
 
-    for idx, label in id2label.items():
-        label_lower = label.lower().replace("_", " ").replace("-", " ")
-        if any(kw in label_lower for kw in _SAFE_LABEL_KEYWORDS):
-            _logger.info(f"Safe label identified: index={idx}, label='{label}'")
-            return int(idx)
-
-    # No safe label found by keyword — fall back and warn
-    _logger.warning(
-        f"Could not identify a safe label by keyword in id2label={id2label}. "
-        f"Falling back to index 0. Scores may be inaccurate."
-    )
-    return 0
-
-
-def set_scoring_models(
-    reward_tokenizer,
-    reward_model,
-    sentiment_pipe,
-    bias_pipe,
-    gen_tokenizer,
-    gen_model,
-):
-    """
-    Called once at startup (from generation.py) to inject all model handles
-    into this module.  Avoids re-loading models and prevents circular imports.
-
-    Also resolves the safe-label index for the toxicity model so
-    _toxicity_score() never hard-codes an assumption about label order.
-    """
-    global _reward_tokenizer, _reward_model
-    global _sentiment_pipeline, _bias_pipeline
-    global _gen_tokenizer, _gen_model
-    global _sbert_model, _safe_label_index
-
-    _reward_tokenizer = reward_tokenizer
-    _reward_model = reward_model
-    _sentiment_pipeline = sentiment_pipe
-    _bias_pipeline = bias_pipe
+    _hf_api_key = hf_api_key
     _gen_tokenizer = gen_tokenizer
     _gen_model = gen_model
 
-    # Resolve which output index is the "safe" class — do this once at startup.
-    _safe_label_index = _resolve_safe_label_index(reward_model)
-
-    # SBERT — force CPU to preserve GPU memory for Phi-3 generation.
-    # SBERT is small (80MB) and fast on CPU — no meaningful speed loss.
+    # SBERT stays local — needed for synchronous RAG embedding.
     _sbert_model = SentenceTransformer(SBERT_MODEL, device="cpu")
-    _logger.info(f"SBERT device: cpu")
+    _logger.info(f"SBERT loaded locally: {SBERT_MODEL} | device: cpu")
+    _logger.info("Toxicity / Sentiment / Bias → HF Inference API")
 
 
 # ---------------------------------------------------------------------------
-# Individual metric helpers (private — use score_candidate() externally)
+# HF Inference API helper
 # ---------------------------------------------------------------------------
+
+def _hf_classify(text: str, model_id: str, retries: int = 3) -> list[dict]:
+    """
+    Call the HF Inference API text-classification endpoint.
+
+    Returns a list of {label, score} dicts.
+    Handles cold-start (503 model loading) with automatic retry + backoff.
+    Falls back to empty list on persistent failure so scoring degrades
+    gracefully rather than crashing.
+    """
+    url = f"{_HF_API_BASE}/{model_id}"
+    headers = {"Authorization": f"Bearer {_hf_api_key}"}
+    payload = {"inputs": text[:512]}   # truncate to stay within token limits
+
+    for attempt in range(retries):
+        try:
+            resp = _http.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 503:
+                # Model is loading — wait and retry
+                wait = 10 * (attempt + 1)
+                _logger.warning(f"HF model {model_id} loading, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            result = resp.json()
+            # HF returns either [[{...}]] or [{...}] depending on model
+            if isinstance(result, list) and result and isinstance(result[0], list):
+                return result[0]
+            return result
+        except Exception as exc:
+            _logger.warning(f"HF API call failed ({model_id}, attempt {attempt+1}): {exc}")
+            if attempt < retries - 1:
+                time.sleep(3)
+
+    _logger.error(f"HF API failed after {retries} attempts for {model_id}")
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Individual metric helpers
+# ---------------------------------------------------------------------------
+
+# Safe label keywords — used to identify which HF output label is "safe"
+_SAFE_LABEL_KEYWORDS = {"nothate", "non-hate", "not hate", "normal", "neutral", "not_hate"}
+_UNSAFE_LABEL_KEYWORDS = {"hate", "toxic", "offensive", "abusive"}
+
+
+def _pick_safe_score(results: list[dict]) -> float:
+    """
+    From a list of {label, score} dicts, return the score for the safe label.
+
+    Identifies the safe label by checking against _SAFE_LABEL_KEYWORDS.
+    Falls back to 0.5 (neutral) if no matching label is found.
+    """
+    for item in results:
+        label_lower = item["label"].lower().replace("_", " ").replace("-", " ")
+        if any(kw in label_lower for kw in _SAFE_LABEL_KEYWORDS):
+            return round(item["score"], 4)
+    # If no safe label found, return neutral
+    _logger.warning(f"Could not identify safe label in: {results}")
+    return 0.5
+
 
 def _toxicity_score(text: str) -> float:
     """
-    Returns a value in [0, 1] where 1.0 means the text is completely safe
-    and 0.0 means it is maximally toxic / hateful.
-
-    How it works:
-      The RoBERTa hate-speech model outputs one logit per class.
-      After softmax, we extract the probability of the SAFE class using
-      _safe_label_index, which is resolved at startup by inspecting
-      model.config.id2label — never assumed to be a fixed index.
-
-      For facebook/roberta-hate-speech-dynabench-r4-target:
-        id2label = {0: 'nothate', 1: 'hate'}
-        → _safe_label_index = 0
-        → toxicity_score = softmax(logits)[0]  (probability of 'nothate')
+    Toxicity safety score in [0, 1] via HF Inference API.
+    1.0 = completely safe, 0.0 = maximally toxic.
     """
-    inputs = _reward_tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=512
-    )
-    # reward_model is loaded on CPU — keep inputs on CPU (no .to() needed)
-    with torch.no_grad():
-        logits = _reward_model(**inputs).logits
-    probs = torch.softmax(logits, dim=-1)[0]
-    # Use the dynamically resolved safe-class index
-    safe_prob = probs[_safe_label_index].item()
-    return round(safe_prob, 4)
+    results = _hf_classify(text, TOXICITY_MODEL)
+    if not results:
+        return 0.5   # neutral fallback on API failure
+    return _pick_safe_score(results)
 
 
 def _sentiment_score(text: str) -> float:
     """
-    Returns a value in [0, 1] reflecting tone quality.
-
-    Scoring logic:
-      - Positive sentiment → 0.8 + 0.2 * confidence  (max 1.0)
-      - Neutral sentiment  → 0.8
-      - Negative sentiment → 1.0 - 0.5 * confidence  (min ~0.5)
-
-    We penalise negative tone because ethically generated text should
-    avoid unnecessarily distressing or hostile language.
+    Sentiment quality score in [0, 1] via HF Inference API.
+    Positive → ~1.0, Neutral → 0.8, Negative → 0.5–0.75.
     """
-    result = _sentiment_pipeline(text[:512])[0]
-    label = result["label"].lower()
-    conf = result["score"]
+    results = _hf_classify(text, SENTIMENT_MODEL)
+    if not results:
+        return 0.8   # neutral fallback
+
+    # Find the highest-confidence label
+    best = max(results, key=lambda x: x["score"])
+    label = best["label"].lower()
+    conf = best["score"]
 
     if "negative" in label:
         return round(1.0 - conf * 0.5, 4)
     elif "positive" in label:
         return round(min(1.0, 0.8 + conf * 0.2), 4)
-    else:
-        return 0.8
+    return 0.8
 
 
 def _bias_score(text: str) -> float:
     """
-    Returns a value in [0, 1] where 1.0 = completely unbiased.
-
-    The DistilRoBERTa bias model outputs a label ("biased" / "not biased")
-    and a confidence score.  We invert the confidence when the label is
-    "biased" so that higher always means safer.
+    Bias safety score in [0, 1] via HF Inference API.
+    1.0 = completely unbiased, 0.0 = strongly biased.
     """
-    result = _bias_pipeline(text[:512])[0]
-    if result["label"].lower() == "biased":
-        return round(1.0 - result["score"], 4)
-    return round(result["score"], 4)
+    results = _hf_classify(text, BIAS_MODEL)
+    if not results:
+        return 0.5   # neutral fallback
+
+    best = max(results, key=lambda x: x["score"])
+    if "biased" in best["label"].lower():
+        return round(1.0 - best["score"], 4)
+    return round(best["score"], 4)
 
 
 def _coherence_score(prompt: str, response: str) -> float:
     """
-    Returns cosine similarity between SBERT embeddings of prompt and response.
-
-    Range: [0, 1] after clamping (raw cosine can be slightly negative).
-    High score = the response is semantically on-topic.
-
-    Guards:
-      - Empty prompt or response → return 0.0 (no meaningful similarity)
-      - NaN cosine result        → return 0.0 (degenerate embedding)
+    SBERT cosine similarity between prompt and response embeddings.
+    Computed locally — SBERT stays on CPU.
     """
     if not prompt or not prompt.strip() or not response or not response.strip():
         return 0.0
 
     prompt_emb = _sbert_model.encode(prompt, convert_to_tensor=True)
-    resp_emb = _sbert_model.encode(response, convert_to_tensor=True)
+    resp_emb   = _sbert_model.encode(response, convert_to_tensor=True)
     sim = float(util.cos_sim(prompt_emb, resp_emb).item())
 
-    # Clamp to [0, 1] and guard against NaN from degenerate embeddings
     if math.isnan(sim) or math.isinf(sim):
-        _logger.warning(f"_coherence_score: cosine similarity is NaN/Inf → returning 0.0")
         return 0.0
 
     return round(max(0.0, min(sim, 1.0)), 4)
@@ -277,94 +229,29 @@ def _coherence_score(prompt: str, response: str) -> float:
 
 def _fluency_score(text: str) -> float:
     """
-    Perplexity-based fluency score in [0, 1].
-
-    Perplexity measures how "surprised" the language model is by the text.
-    A well-formed English sentence has low perplexity; garbled or repetitive
-    text has high perplexity.
-
-    We reuse the generation model (already in memory) as the evaluator:
-      1. Tokenise the text.
-      2. Run a forward pass with the text as both input AND labels.
-         PyTorch computes cross-entropy loss automatically.
-      3. Convert loss → perplexity = exp(loss).
-      4. Map to [0, 1]: score = 1 / (1 + log(perplexity)).
-         log() keeps the score meaningful across a wide perplexity range.
-
-    Empty text is returned as 0.0 immediately — tokenising an empty string
-    produces a zero-element tensor that crashes the reshape inside the model.
+    Perplexity-based fluency score via distilgpt2 (local CPU).
+    1.0 = very fluent, 0.0 = incoherent.
     """
-    # Guard: empty or whitespace-only text cannot be tokenised safely.
     if not text or not text.strip():
         return 0.0
 
-    inputs = _gen_tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=512
-    )
-    # When device_map="auto" is used (Accelerate), next(model.parameters()).device
-    # returns "meta" for the dispatch proxy — not the real device.
-    # Instead, resolve the actual input device from the model's device map,
-    # falling back to the first non-meta device found, or "cpu" as last resort.
-    try:
-        if hasattr(_gen_model, "hf_device_map") and _gen_model.hf_device_map:
-            # hf_device_map maps layer names to devices, e.g. {"model.embed_tokens": 0}
-            # Use the first real device (not "cpu" or "meta" if possible)
-            devices = list(_gen_model.hf_device_map.values())
-            # Prefer cuda devices
-            cuda_devices = [d for d in devices if isinstance(d, int) or (isinstance(d, str) and "cuda" in str(d))]
-            model_device = f"cuda:{cuda_devices[0]}" if cuda_devices and isinstance(cuda_devices[0], int) else (cuda_devices[0] if cuda_devices else "cpu")
-        else:
-            # Fallback: find first non-meta parameter
-            model_device = "cpu"
-            for param in _gen_model.parameters():
-                if param.device.type != "meta":
-                    model_device = param.device
-                    break
-    except Exception:
-        model_device = "cpu"
-
-    inputs = {k: v.to(model_device) for k, v in inputs.items()}
+    inputs = _gen_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
         outputs = _gen_model(**inputs, labels=inputs["input_ids"])
 
     loss = outputs.loss.item()
-
-    # Guard: NaN or Inf loss means the model produced degenerate output
     if math.isnan(loss) or math.isinf(loss):
-        _logger.warning(f"_fluency_score: loss is {'NaN' if math.isnan(loss) else 'Inf'} → returning 0.0")
         return 0.0
-
-    # Guard: unusually high loss (> 20) indicates near-random text.
-    # exp(20) ≈ 485M perplexity — effectively meaningless, return low score.
     if loss > 20:
-        _logger.warning(f"_fluency_score: unusually high loss={loss:.2f} → returning 0.1")
         return 0.1
 
-    perplexity = math.exp(min(loss, 100.0))   # cap before exp to avoid overflow
+    perplexity = math.exp(min(loss, 100.0))
     score = 1.0 / (1.0 + math.log(max(perplexity, 1.0)))
-
-    # Free GPU memory after using Phi-3 for fluency scoring.
-    # Fluency is the only metric that runs on GPU (via gen_model).
-    # Calling empty_cache() here prevents fragmentation accumulating
-    # across multiple score_candidate() calls in /ask reranking.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     return safe_float(score, default=0.0, label="fluency_score")
 
 
 def _manipulation_penalty(text: str) -> float:
-    """
-    Scans text for manipulation trigger phrases and returns a penalty value.
-
-    Each trigger phrase found adds MANIPULATION_PENALTY_PER_WORD (0.1).
-    The total is capped at MANIPULATION_PENALTY_MAX (0.5).
-
-    Trigger phrases are defined in config.py and include coercive language
-    like "no choice", "trust me blindly", "you will regret", etc.
-    These patterns are common in misinformation, scam content, and
-    emotionally manipulative writing.
-    """
+    """Scan for manipulation trigger phrases. Returns penalty in [0, 0.5]."""
     text_lower = text.lower()
     penalty = sum(
         MANIPULATION_PENALTY_PER_WORD
@@ -381,53 +268,24 @@ def _manipulation_penalty(text: str) -> float:
 def score_candidate(prompt: str, text: str, alpha: float) -> CandidateScores:
     """
     Compute all safety and quality metrics for a single candidate text.
-
-    This is the ONLY function other modules should call.
-    All metrics are computed exactly once and bundled into a CandidateScores
-    object, which is then reused everywhere (no redundant inference calls).
-
-    Parameters
-    ----------
-    prompt : str
-        The original user prompt (needed for coherence scoring).
-    text : str
-        The candidate completion to evaluate.  If empty, replaced with
-        EMPTY_OUTPUT_FALLBACK before scoring so no downstream function
-        ever receives a blank string.
-    alpha : float
-        Weight for ethics vs fluency in the final score.
-        alpha=1.0 → pure ethics, alpha=0.0 → pure fluency.
-
-    Returns
-    -------
-    CandidateScores
-        A fully populated score object ready to be serialised and returned
-        in API responses or written to evaluation CSVs.
+    All metrics computed once — no redundant API calls.
     """
-    # Guard: replace empty candidates before any metric touches the text.
-    # This is a last-resort safety net; generate_one() and generate_candidates()
-    # should already prevent empty strings from reaching here.
     if not text or not text.strip():
-        _logger.warning("score_candidate() received empty text — substituting fallback.")
+        _logger.warning("score_candidate(): empty text — substituting fallback.")
         text = EMPTY_OUTPUT_FALLBACK
 
-    tox   = safe_float(_toxicity_score(text),          label="toxicity_score")
-    sent  = safe_float(_sentiment_score(text),          label="sentiment_score")
-    bias  = safe_float(_bias_score(text),               label="bias_score")
-    coh   = safe_float(_coherence_score(prompt, text),  label="coherence_score")
-    flu   = safe_float(_fluency_score(text),            label="fluency_score")
-    manip = safe_float(_manipulation_penalty(text),     label="manipulation_penalty")
+    tox   = safe_float(_toxicity_score(text),         label="toxicity_score")
+    sent  = safe_float(_sentiment_score(text),         label="sentiment_score")
+    bias  = safe_float(_bias_score(text),              label="bias_score")
+    coh   = safe_float(_coherence_score(prompt, text), label="coherence_score")
+    flu   = safe_float(_fluency_score(text),           label="fluency_score")
+    manip = safe_float(_manipulation_penalty(text),    label="manipulation_penalty")
 
-    # Ethics composite — weighted average of the four safety dimensions
     ethics = safe_float(
-        WEIGHT_TOXICITY * tox
-        + WEIGHT_SENTIMENT * sent
-        + WEIGHT_BIAS * bias
-        + WEIGHT_COHERENCE * coh,
+        WEIGHT_TOXICITY * tox + WEIGHT_SENTIMENT * sent +
+        WEIGHT_BIAS * bias + WEIGHT_COHERENCE * coh,
         label="ethics_score",
     )
-
-    # Final score balances ethics and fluency, then subtracts manipulation
     final = safe_float(
         alpha * ethics + (1 - alpha) * flu - manip,
         label="final_score",
@@ -447,76 +305,26 @@ def score_candidate(prompt: str, text: str, alpha: float) -> CandidateScores:
 
 
 def score_prompt_risk(prompt: str) -> float:
-    """
-    Assess the toxicity risk of the prompt itself (before any generation).
-
-    Returns a risk value in [0, 1] where:
-      0.0 = completely safe prompt
-      1.0 = maximally toxic / harmful prompt
-
-    This is the INVERSE of _toxicity_score because we want "risk" to be
-    high when the text is dangerous (toxicity_score is high when safe).
-    """
+    """Toxicity risk of the prompt itself. 0.0=safe, 1.0=toxic."""
     return round(1.0 - _toxicity_score(prompt), 4)
 
-# ---------------------------------------------------------------------------
-# Public manipulation penalty wrapper
-# ---------------------------------------------------------------------------
-# _manipulation_penalty() is private by naming convention.
-# main.py and any external module must use this public wrapper.
 
 def get_manipulation_penalty(text: str) -> float:
-    """Public wrapper for _manipulation_penalty(). Use this in main.py."""
+    """Public wrapper for _manipulation_penalty()."""
     return _manipulation_penalty(text)
 
 
 # ---------------------------------------------------------------------------
-# Batch scoring helpers (for /analyze-document on large documents)
+# Batch scoring helpers (used by /analyze-document)
 # ---------------------------------------------------------------------------
-# These run each model ONCE over ALL sentences in a single batch call,
-# instead of calling score_candidate() per sentence (5 model calls each).
-# ~10x faster for large documents.
+# With HF Inference API we call per-text (no local batch). Sub-batching is
+# handled by rate-limiting logic inside _hf_classify().
 
 def batch_toxicity_scores(texts: list) -> list:
-    """
-    Run toxicity model over all texts in one batched call.
-    Returns list of safety scores (1.0 = safe, 0.0 = toxic).
-    Processes in sub-batches of 32 to avoid OOM on T4.
-    """
-    results = []
-    batch_size = 32
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        inputs = _reward_tokenizer(
-            batch,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding=True,
-        )
-        # reward_model is on CPU — inputs stay on CPU
-        with torch.no_grad():
-            logits = _reward_model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1)
-        safe_probs = probs[:, _safe_label_index].tolist()
-        results.extend([round(p, 4) for p in safe_probs])
-    return results
+    """Run toxicity scoring over all texts via HF API. Returns safety scores."""
+    return [safe_float(_toxicity_score(t), label="batch_tox") for t in texts]
 
 
 def batch_bias_scores(texts: list) -> list:
-    """
-    Run bias model over all texts in one batched call.
-    Returns list of safety scores (1.0 = unbiased, 0.0 = strongly biased).
-    Processes in sub-batches of 32 to avoid OOM on T4.
-    """
-    results = []
-    batch_size = 32
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        batch_results = _bias_pipeline(
-            batch, truncation=True, max_length=512, batch_size=batch_size
-        )
-        for r in batch_results:
-            score = (1.0 - r["score"]) if r["label"].lower() == "biased" else r["score"]
-            results.append(round(score, 4))
-    return results
+    """Run bias scoring over all texts via HF API. Returns safety scores."""
+    return [safe_float(_bias_score(t), label="batch_bias") for t in texts]
