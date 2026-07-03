@@ -1,31 +1,27 @@
 # EthicalGuard — Python dependencies
 #
-# RAM profile on Render free tier (512MB):
-#   distilgpt2 (fluency):  ~250MB  (local)
-#   SBERT all-MiniLM:       ~90MB  (local)
-#   Toxicity/Sentiment/Bias: 0MB   (HF Inference API)
-#   Total:                 ~340MB  ✅ fits free tier
+# RAM profile (torch-free):
+#   Python + FastAPI overhead: ~50MB
+#   No torch / transformers / sentence-transformers loaded
+#   All ML inference via external APIs (Groq + HF Inference)
+#   Total: ~50MB ✅ fits Render free tier (512MB) with ease
 #
-# API keys required (set as environment variables):
-#   GROQ_API_KEY  — https://console.groq.com
-#   HF_API_KEY    — https://huggingface.co/settings/tokens
+# Required environment variables:
+#   GROQ_API_KEY  → https://console.groq.com  (free)
+#   HF_API_KEY    → https://huggingface.co/settings/tokens  (free)
 
 # --- API framework ---
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 
-# --- Core ML (local models only: distilgpt2 + SBERT) ---
-torch>=2.0.0
-transformers>=4.40.0
-sentence-transformers>=2.7.0
-
 # --- API clients ---
 groq                   # Groq API for Llama-3.3-70B generation
-requests>=2.32.0       # HF Inference API HTTP calls (already in stdlib-adjacent)
+requests>=2.32.0       # HF Inference API HTTP calls
 
-# --- Vector DB ---
+# --- Vector DB (CPU-only numpy index, no torch needed) ---
 faiss-cpu
+numpy
 
 # --- Document ingestion ---
 pdfplumber>=0.11.0
@@ -33,4 +29,3 @@ PyPDF2>=3.0.1
 
 # --- Data / validation ---
 pydantic>=2.7.0
-numpy

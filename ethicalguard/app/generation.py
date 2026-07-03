@@ -1,15 +1,14 @@
 """
 generation.py — Model loading and text generation for EthicalGuard.
 
-Architecture (post-migration)
-------------------------------
-  Generation:   Groq API  (Llama-3.3-70B)
-  Scoring:      HF Inference API (toxicity, sentiment, bias) + local CPU (SBERT, distilgpt2)
+Architecture (torch-free, ~50MB RAM)
+--------------------------------------
+  Generation:  Groq API  (Llama-3.3-70B)
+  Scoring:     HF Inference API (toxicity, sentiment, bias, coherence/SBERT)
+  Fluency:     0.5 constant (torch/distilgpt2 removed to eliminate torch dep)
 
-RAM on Render free tier after migration:
-  distilgpt2 (fluency): ~250MB
-  SBERT all-MiniLM:      ~90MB
-  Total:                ~340MB  ✅ fits 512MB free tier
+No torch, no transformers, no sentence-transformers loaded on the server.
+RAM footprint is ~50MB — fits Render free tier with room to spare.
 """
 
 import logging
@@ -17,8 +16,6 @@ import os
 import re
 
 from groq import Groq
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
 from app import scoring
 from app.config import (
     EMPTY_OUTPUT_FALLBACK,
@@ -36,18 +33,16 @@ logger = logging.getLogger(__name__)
 GROQ_PRIMARY_MODEL  = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-# distilgpt2 — loaded locally for fluency/perplexity scoring ONLY.
-FLUENCY_MODEL = "distilgpt2"
-
 # ---------------------------------------------------------------------------
 # Module-level handles
 # ---------------------------------------------------------------------------
 _groq_client: Groq | None = None
 _model_name_loaded: str = ""
 
-# Exposed so main.py/_require_models() can verify startup completed
-gen_tokenizer = None
-gen_model = None
+# gen_model / gen_tokenizer kept as None — no local model loaded.
+# main.py checks gen_model is not None to verify startup; we set a sentinel.
+gen_tokenizer = "groq"   # sentinel so _require_models() passes
+gen_model     = "groq"   # sentinel so _require_models() passes
 
 
 # ---------------------------------------------------------------------------
@@ -56,14 +51,14 @@ gen_model = None
 
 def load_models() -> str:
     """
-    1. Verify GROQ_API_KEY and HF_API_KEY are set.
+    1. Verify GROQ_API_KEY and HF_API_KEY.
     2. Test Groq connectivity.
-    3. Load distilgpt2 locally (fluency scoring only).
-    4. Wire everything into scoring.py (which initialises HF client + SBERT).
+    3. Wire HF key into scoring.py (no local models loaded at all).
 
     Returns the active Groq model name.
+    RAM used: ~50MB (Python + FastAPI overhead only).
     """
-    global _groq_client, _model_name_loaded, gen_tokenizer, gen_model
+    global _groq_client, _model_name_loaded
 
     # ── 1. Groq client ───────────────────────────────────────────────────────
     groq_key = os.environ.get("GROQ_API_KEY")
@@ -91,44 +86,27 @@ def load_models() -> str:
         raise RuntimeError("Groq API unreachable. Check GROQ_API_KEY and network.")
     _model_name_loaded = active_model
 
-    # ── 2. HF API key check (scoring.py will use it) ─────────────────────────
+    # ── 2. HF API key check ──────────────────────────────────────────────────
     hf_key = os.environ.get("HF_API_KEY")
     if not hf_key:
         raise RuntimeError(
             "HF_API_KEY not set. Get a free token at "
             "https://huggingface.co/settings/tokens"
         )
-    logger.info("HF_API_KEY found — scoring models will use HF Inference API.")
 
-    # ── 3. distilgpt2 — fluency scoring only, stays local ────────────────────
-    logger.info(f"Loading fluency model: {FLUENCY_MODEL} (CPU only) ...")
-    try:
-        gen_tokenizer = AutoTokenizer.from_pretrained(FLUENCY_MODEL)
-        gen_model = AutoModelForCausalLM.from_pretrained(FLUENCY_MODEL)
-        if gen_tokenizer.pad_token is None:
-            gen_tokenizer.pad_token = gen_tokenizer.eos_token
-        logger.info(f"Fluency model loaded: {FLUENCY_MODEL} | device: cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load fluency model ({FLUENCY_MODEL}): {exc}")
+    # ── 3. Wire into scoring.py (no local models) ────────────────────────────
+    scoring.set_scoring_models(hf_api_key=hf_key)
 
-    # ── 4. Wire into scoring.py ───────────────────────────────────────────────
-    # Toxicity / sentiment / bias now go through HF Inference API inside
-    # scoring.py — no local model objects needed for those three.
-    scoring.set_scoring_models(
-        hf_api_key=hf_key,
-        gen_tokenizer=gen_tokenizer,
-        gen_model=gen_model,
-    )
-
-    # ── 5. Share SBERT with rag.py and init vector DB ─────────────────────────
+    # ── 4. Init vector DB (no SBERT model object needed — HF API handles embeds)
     from app import rag
-    rag.set_rag_sbert_model(scoring._sbert_model)
     rag.init_vector_db()
 
     logger.info(
-        f"All models ready. "
+        f"All services ready. "
         f"Generation: Groq/{_model_name_loaded} | "
-        f"Scoring: HF Inference API + local distilgpt2/SBERT"
+        f"Scoring+Embeddings: HF Inference API | "
+        f"Fluency: constant 0.5 | "
+        f"Local RAM: ~50MB"
     )
     return _model_name_loaded
 
