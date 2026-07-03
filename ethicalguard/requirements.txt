@@ -1,40 +1,35 @@
 # EthicalGuard — Python dependencies
 #
-# Colab install order (run in this sequence to avoid conflicts):
-#   pip install transformers==4.41.2 accelerate==0.30.1 peft==0.11.1 sentence-transformers==2.7.0
-#   pip install -r requirements.txt
+# On Colab: install only what's missing, let Colab's environment handle
+# the rest. Do NOT use exact pins (==) on Colab — they conflict with
+# pre-installed packages like gradio, google-adk, langchain.
 #
-# transformers is pinned to 4.41.2 — Phi-3-mini requires >=4.40.0.
-# sentence-transformers 2.7.0 is used on Colab (3.x has a breaking API change
-# with some versions of transformers; 2.7.0 is stable across the stack).
+# Install command for Colab:
+#   pip install -r requirements.txt -q
+#   pip install groq -q
 
 # --- API framework ---
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9   # required for FastAPI file uploads
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
 
 # --- Core ML ---
-torch==2.3.0
-transformers==4.41.2      # pinned: Phi-3 requires >=4.40; 4.41.2 tested on Colab T4
-accelerate==0.30.1        # device_map="auto" and float16 loading
+torch>=2.0.0
+transformers>=4.40.0        # Phi-3 requires >=4.40; kept for tokenizers/pipelines
+accelerate>=0.30.0
+sentence-transformers>=2.7.0
 
 # --- Generation API ---
-groq                      # Groq API client for Llama-3.3-70B generation
-
-# --- Embeddings & similarity ---
-sentence-transformers==2.7.0   # SBERT for coherence scoring and RAG retrieval
-
-# --- Safety scoring models ---
-# (loaded via transformers — no extra pip install needed)
+groq                        # Groq API client for Llama-3.3-70B generation
 
 # --- Vector DB ---
-faiss-cpu                 # FAISS flat L2 index for RAG retrieval
+faiss-cpu
 
 # --- Document ingestion ---
-pdfplumber==0.11.0        # primary PDF text extractor
-PyPDF2==3.0.1             # fallback PDF extractor
+pdfplumber>=0.11.0
+PyPDF2>=3.0.1
 
 # --- Data / validation ---
-pydantic==2.7.1
+pydantic>=2.7.0
 numpy
-requests==2.32.2          # used by evaluate.py to call the API
+requests>=2.32.0
