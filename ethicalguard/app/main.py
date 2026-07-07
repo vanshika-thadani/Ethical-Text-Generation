@@ -77,8 +77,17 @@ async def lifespan(app: FastAPI):
     logger.info("EthicalGuard starting — loading models...")
     try:
         loaded = generation.load_models()
-        # load_models() also calls rag.set_rag_sbert_model() and rag.init_vector_db()
         logger.info(f"Ready. Generation model: {loaded}")
+
+        # Warm up HF Inference API models with a dummy call so the first
+        # real user request doesn't pay the cold-start penalty (~10-20s).
+        logger.info("Warming up HF Inference API models...")
+        try:
+            scoring.score_candidate("test", "test", 0.7)
+            logger.info("HF models warmed up successfully.")
+        except Exception as e:
+            logger.warning(f"Warmup failed (non-critical): {e}")
+
     except RuntimeError as exc:
         logger.error(f"Model loading failed: {exc}")
     yield
