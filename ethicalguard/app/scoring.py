@@ -34,7 +34,8 @@ _logger = _logging.getLogger(__name__)
 # Module-level state
 # ---------------------------------------------------------------------------
 _hf_api_key: str = ""
-_HF_API_BASE = "https://api-inference.huggingface.co/models"
+# HF Inference API v2 — router subdomain is accessible where api-inference is blocked
+_HF_API_BASE = "https://router.huggingface.co/hf-inference/models"
 
 # Kept for backwards-compat (rag.py calls set_rag_sbert_model which is now a no-op)
 _sbert_model = None
@@ -98,8 +99,12 @@ def _hf_post(endpoint: str, payload: dict, retries: int = 3) -> list:
                 continue
             resp.raise_for_status()
             result = resp.json()
-            # HF returns [[{...}]] or [{...}] depending on model
-            if isinstance(result, list) and result and isinstance(result[0], list):
+            # Classification models return [[{label, score}, ...]] — unwrap outer list.
+            # Feature-extraction (embeddings) returns [[float, ...], [float, ...]] —
+            # do NOT unwrap, we need all vectors.
+            if (isinstance(result, list) and result
+                    and isinstance(result[0], list)
+                    and result[0] and isinstance(result[0][0], dict)):
                 return result[0]
             return result
         except Exception as exc:
@@ -125,14 +130,18 @@ def _hf_embed(texts: list[str]) -> list[list[float]]:
     Falls back to zero vectors on failure.
     """
     result = _hf_post(
-        f"{_HF_API_BASE}/{SBERT_MODEL}",
+        f"{_HF_API_BASE}/{SBERT_MODEL}/pipeline/feature-extraction",
         {"inputs": texts}
     )
     if not result:
         # Return zero vectors as fallback
         return [[0.0] * 384 for _ in texts]
-    # HF feature-extraction returns shape [n_texts, seq_len, hidden] or [n_texts, hidden]
-    # all-MiniLM-L6-v2 returns [n_texts, 384] directly
+    # HF feature-extraction /pipeline/feature-extraction returns shape [n_texts, 384]
+    # but for single input it may return just [384] (a flat list of floats).
+    # Normalise to always be a list of lists.
+    if result and isinstance(result[0], float):
+        # Single text — wrap into a list of one vector
+        result = [result]
     if isinstance(result[0], list) and isinstance(result[0][0], list):
         # Shape is [n_texts, seq_len, 384] — mean-pool over seq_len
         pooled = []

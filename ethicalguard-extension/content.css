@@ -1,0 +1,91 @@
+/* EthicalGuard content script styles */
+
+/* Underlined flagged text */
+.eg-flagged {
+  text-decoration: underline wavy;
+  text-decoration-color: #ef4444;
+  text-decoration-skip-ink: none;
+  cursor: pointer;
+  position: relative;
+}
+
+.eg-flagged[data-severity="MEDIUM"] {
+  text-decoration-color: #f97316;
+}
+
+/* Tooltip */
+.eg-tooltip {
+  position: absolute;
+  z-index: 2147483647;
+  background: #1e1e2e;
+  color: #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  max-width: 320px;
+  min-width: 200px;
+  font-size: 13px;
+  line-height: 1.5;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+  pointer-events: auto;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.eg-tooltip-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.eg-badge-high   { color: #f87171; }
+.eg-badge-medium { color: #fb923c; }
+
+.eg-tooltip-reason {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-bottom: 8px;
+}
+
+.eg-tooltip-divider {
+  border: none;
+  border-top: 1px solid #334155;
+  margin: 8px 0;
+}
+
+.eg-tooltip-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #64748b;
+  margin-bottom: 4px;
+}
+
+.eg-tooltip-rewrite {
+  color: #86efac;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.eg-tooltip-loading {
+  color: #94a3b8;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.eg-copy-btn {
+  margin-top: 8px;
+  background: #312e81;
+  color: #c7d2fe;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.eg-copy-btn:hover { background: #3730a3; }

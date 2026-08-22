@@ -104,7 +104,10 @@ class AskResponse(BaseModel):
     question: str
     retrieved_chunks: List[RetrievedChunk]
     answer: str
-    ethical_scores: CandidateScores
+    ethical_scores: CandidateScores        # scores of the generated ANSWER (answer quality)
+    context_toxicity_risk: float = 0.0     # worst toxicity risk across retrieved chunks
+    context_bias_risk: float = 0.0         # worst bias risk across retrieved chunks
+    context_manipulation: float = 0.0      # worst manipulation penalty across retrieved chunks
 
 
 class ChunkAnalysis(BaseModel):

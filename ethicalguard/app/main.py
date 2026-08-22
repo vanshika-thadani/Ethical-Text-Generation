@@ -411,11 +411,33 @@ def ask(req: AskRequest):
         logger.error(f"/ask — generation failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Answer generation failed: {exc}")
 
+    # Step 6: Score context risk across ALL stored chunks for this document,
+    # not just the top-k retrieved ones. RAG retrieval optimises for relevance
+    # to the question — not for finding the most dangerous content. Scanning all
+    # chunks gives an accurate picture of the document's true risk profile.
+    try:
+        all_doc_chunks = rag.get_all_chunks_for_document(req.document_name) if req.document_name else [c["text"] for c in chunks]
+        if not all_doc_chunks:
+            all_doc_chunks = [c["text"] for c in chunks]
+    except Exception:
+        all_doc_chunks = [c["text"] for c in chunks]
+
+    context_tox_scores  = scoring.batch_toxicity_scores(all_doc_chunks)
+    context_bias_scores_raw = scoring.batch_bias_scores(all_doc_chunks)
+    context_manip       = [scoring.get_manipulation_penalty(t) for t in all_doc_chunks]
+
+    worst_tox_risk  = round(max(1.0 - s for s in context_tox_scores),       4)
+    worst_bias_risk = round(max(1.0 - s for s in context_bias_scores_raw),   4)
+    worst_manip     = round(max(context_manip),                               4)
+
     return AskResponse(
         question=req.question,
         retrieved_chunks=[RetrievedChunk(**c) for c in chunks],
         answer=best.text,
         ethical_scores=best,
+        context_toxicity_risk=worst_tox_risk,
+        context_bias_risk=worst_bias_risk,
+        context_manipulation=worst_manip,
     )
 
 
@@ -496,14 +518,16 @@ def analyze_document(req: AnalyzeDocumentRequest):
         bias_risk  = round(1.0 - bias_score, 4)
         manip      = manip_penalties[idx]
 
-        # Stage 2: full scoring for suspicious sentences only
-        suspicious = tox_risk > 0.12 or bias_risk > 0.12 or manip > 0
+        # Stage 2: full scoring for suspicious sentences only.
+        # Threshold raised from 0.12 → 0.35 to eliminate false positives
+        # from model noise on neutral/technical text.
+        suspicious = tox_risk > 0.35 or bias_risk > 0.35 or manip > 0.15
 
         if suspicious:
             full = scoring.score_candidate(sentence, sentence, DEFAULT_ALPHA)
-            if tox_risk > 0.5 or bias_risk > 0.6 or manip > 0.3:
+            if tox_risk > 0.65 or bias_risk > 0.70 or manip > 0.35:
                 severity = "HIGH"
-            elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
+            elif tox_risk > 0.45 or bias_risk > 0.45 or manip > 0.20 or full.ethics_score < 0.50:
                 severity = "MEDIUM"
             else:
                 severity = "LOW"
@@ -630,11 +654,9 @@ def rewrite(req: RewriteRequest):
 def analyze_chunks(req: ChunksInput):
     """
     Browser extension endpoint.
-    Accepts webpage text as a list of chunks, scores each one,
-    returns severity + optional rewrite for flagged items.
-
-    Set auto_rewrite=False for fast initial page scan.
-    Set auto_rewrite=True only when user requests corrections.
+    Accepts webpage text as a list of chunks, scores each one.
+    Always generates a safe rewrite for HIGH and MEDIUM chunks so the
+    extension can underline unsafe text and show the replacement inline.
     """
     _require_models()
 
@@ -643,7 +665,7 @@ def analyze_chunks(req: ChunksInput):
 
     texts = [c.text for c in req.chunks]
 
-    # Stage 1: batch
+    # Stage 1: batch scoring
     tox_scores      = scoring.batch_toxicity_scores(texts)
     bias_scores     = scoring.batch_bias_scores(texts)
     manip_penalties = [scoring.get_manipulation_penalty(t) for t in texts]
@@ -655,32 +677,50 @@ def analyze_chunks(req: ChunksInput):
         bias_risk = round(1.0 - bias_scores[i], 4)
         manip     = manip_penalties[i]
 
-        suspicious = tox_risk > 0.12 or bias_risk > 0.12 or manip > 0
+        # Threshold raised from 0.12 → 0.35 to eliminate false positives
+        # from model noise on neutral/technical/UI text.
+        suspicious = tox_risk > 0.35 or bias_risk > 0.35 or manip > 0.15
 
         if suspicious:
             full = scoring.score_candidate(chunk.text, chunk.text, DEFAULT_ALPHA)
-            if tox_risk > 0.5 or bias_risk > 0.6 or manip > 0.3:
+            if tox_risk > 0.65 or bias_risk > 0.70 or manip > 0.35:
                 severity = "HIGH"
-            elif tox_risk > 0.2 or bias_risk > 0.2 or manip > 0.1 or full.ethics_score < 0.65:
+            elif tox_risk > 0.45 or bias_risk > 0.45 or manip > 0.20 or full.ethics_score < 0.50:
                 severity = "MEDIUM"
             else:
                 severity = "LOW"
         else:
             severity = "LOW"
 
+        # Generate rewrite only for genuinely flagged chunks.
+        # Always generate rewrite for flagged chunks — extension needs it to
+        # show the replacement tooltip immediately on page load.
         rewritten = None
-        if severity in ("HIGH", "MEDIUM") and req.auto_rewrite:
+        if severity in ("HIGH", "MEDIUM"):
             try:
                 candidates = generation.generate_rewrite_candidates(
-                    chunk.text, num_candidates=2, max_tokens=60
+                    chunk.text, num_candidates=2, max_tokens=80
                 )
                 scored = [
                     scoring.score_candidate(chunk.text, c, DEFAULT_ALPHA)
                     for c in candidates
                 ]
                 rewritten = max(scored, key=lambda s: s.final_score).text
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"/analyze-chunks rewrite failed for chunk {chunk.id}: {exc}")
                 rewritten = None
+
+        # Reason label for the tooltip (most dominant signal wins)
+        reason = None
+        if severity in ("HIGH", "MEDIUM"):
+            if tox_risk > 0.45:
+                reason = "toxic language"
+            elif manip > 0.20:
+                reason = "manipulative language"
+            elif bias_risk > 0.45:
+                reason = "biased language"
+            else:
+                reason = "unsafe content"
 
         results.append({
             "id": chunk.id,
@@ -688,6 +728,7 @@ def analyze_chunks(req: ChunksInput):
             "toxicity_risk": tox_risk,
             "bias_risk": bias_risk,
             "manipulation_penalty": manip,
+            "reason": reason,
             "rewritten": rewritten,
         })
 

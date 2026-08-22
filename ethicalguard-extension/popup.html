@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EthicalGuard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 300px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .logo {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .header-text h1 { font-size: 15px; font-weight: 700; color: #f1f5f9; }
+    .header-text p  { font-size: 11px; color: #64748b; margin-top: 1px; }
+
+    /* Toggle row */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .toggle-label { font-size: 13px; color: #cbd5e1; font-weight: 500; }
+
+    /* Toggle switch */
+    .switch { position: relative; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #334155; border-radius: 24px;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .slider::before {
+      content: "";
+      position: absolute;
+      width: 18px; height: 18px;
+      left: 3px; top: 3px;
+      background: #fff; border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    input:checked + .slider { background: #6366f1; }
+    input:checked + .slider::before { transform: translateX(20px); }
+
+    /* Stats */
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 1px;
+      background: #1e293b;
+      border-bottom: 1px solid #1e293b;
+    }
+    .stat {
+      background: #0f172a;
+      padding: 12px 8px;
+      text-align: center;
+    }
+    .stat-num { font-size: 22px; font-weight: 700; }
+    .stat-num.high   { color: #f87171; }
+    .stat-num.medium { color: #fb923c; }
+    .stat-num.safe   { color: #4ade80; }
+    .stat-lbl { font-size: 10px; color: #64748b; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    /* Buttons */
+    .actions { padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+
+    .btn {
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      font-family: inherit;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary  { background: #6366f1; color: #fff; }
+    .btn-ghost    { background: #1e293b; color: #94a3b8; }
+
+    /* API URL */
+    .api-section { padding: 0 16px 14px; }
+    .api-label   { font-size: 10px; color: #475569; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+    .api-input   {
+      width: 100%;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #94a3b8;
+      font-size: 12px;
+      padding: 6px 10px;
+      font-family: monospace;
+      outline: none;
+    }
+    .api-input:focus { border-color: #6366f1; }
+
+    /* Status bar */
+    .status-bar {
+      padding: 8px 16px;
+      font-size: 11px;
+      color: #475569;
+      border-top: 1px solid #1e293b;
+      text-align: center;
+    }
+    .status-bar.scanning { color: #818cf8; }
+    .status-bar.error    { color: #f87171; }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">🛡️</div>
+    <div class="header-text">
+      <h1>EthicalGuard</h1>
+      <p>AI Content Safety</p>
+    </div>
+  </div>
+
+  <!-- Toggle -->
+  <div class="toggle-row">
+    <span class="toggle-label">Enable on this page</span>
+    <label class="switch">
+      <input type="checkbox" id="toggle" checked />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-num high"   id="count-high">—</div>
+      <div class="stat-lbl">High Risk</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num medium" id="count-medium">—</div>
+      <div class="stat-lbl">Medium Risk</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num safe"   id="count-safe">—</div>
+      <div class="stat-lbl">Safe</div>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-rescan">🔍 Re-scan page</button>
+    <button class="btn btn-ghost"   id="btn-clear">✕ Clear highlights</button>
+  </div>
+
+  <!-- API URL -->
+  <div class="api-section">
+    <div class="api-label">Backend URL</div>
+    <input class="api-input" id="api-url" type="text" value="http://127.0.0.1:8000" />
+  </div>
+
+  <!-- Status -->
+  <div class="status-bar" id="status">Ready</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

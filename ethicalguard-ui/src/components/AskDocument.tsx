@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { MessageSquare, ChevronDown, AlertCircle, BookOpen } from 'lucide-react';
+import { MessageSquare, ChevronDown, AlertCircle, BookOpen, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { askQuestion, getErrorMessage } from '../services/api';
 import type { AskResponse } from '../types/api';
 import LoadingSpinner from './LoadingSpinner';
 import ScoreCard from './ScoreCard';
+import ScoreBar from './ScoreBar';
 
 const EXAMPLE_QUESTIONS = [
   'Which parts of this document may be unethical?',
@@ -15,6 +16,20 @@ const EXAMPLE_QUESTIONS = [
 
 interface Props {
   activeDocument: string;
+}
+
+// Risk badge helper
+function RiskBadge({ value, label }: { value: number; label: string }) {
+  const pct = Math.round(value * 100);
+  const color = pct >= 60 ? 'bg-rose-100 text-rose-700 border-rose-200'
+              : pct >= 35 ? 'bg-orange-100 text-orange-700 border-orange-200'
+              :              'bg-emerald-100 text-emerald-700 border-emerald-200';
+  return (
+    <div className={`flex items-center justify-between px-3 py-2 rounded-xl border text-sm ${color}`}>
+      <span className="font-medium">{label}</span>
+      <span className="font-bold">{pct}%</span>
+    </div>
+  );
 }
 
 export default function AskDocument({ activeDocument }: Props) {
@@ -39,6 +54,15 @@ export default function AskDocument({ activeDocument }: Props) {
       setLoading(false);
     }
   }
+
+  // Determine overall document risk level from context scores
+  const docRiskLevel = result
+    ? (result.context_toxicity_risk >= 0.60 || result.context_bias_risk >= 0.60 || result.context_manipulation >= 0.35)
+        ? 'HIGH'
+      : (result.context_toxicity_risk >= 0.35 || result.context_bias_risk >= 0.35 || result.context_manipulation >= 0.20)
+        ? 'MEDIUM'
+      : 'LOW'
+    : null;
 
   return (
     <div className="space-y-5">
@@ -104,6 +128,57 @@ export default function AskDocument({ activeDocument }: Props) {
             <p className="text-slate-700 leading-relaxed">{result.answer}</p>
           </div>
 
+          {/* ── Document Content Risk ── */}
+          <div className={`rounded-2xl border p-5 space-y-3 ${
+            docRiskLevel === 'HIGH'   ? 'bg-rose-50 border-rose-200' :
+            docRiskLevel === 'MEDIUM' ? 'bg-orange-50 border-orange-200' :
+                                        'bg-emerald-50 border-emerald-200'
+          }`}>
+            <div className="flex items-center gap-2">
+              {docRiskLevel === 'LOW'
+                ? <ShieldCheck className="w-5 h-5 text-emerald-600" />
+                : <ShieldAlert className={`w-5 h-5 ${docRiskLevel === 'HIGH' ? 'text-rose-600' : 'text-orange-500'}`} />
+              }
+              <p className="text-sm font-bold text-slate-700">
+                Document Content Risk
+                <span className={`ml-2 text-xs font-bold px-2 py-0.5 rounded-full ${
+                  docRiskLevel === 'HIGH'   ? 'bg-rose-100 text-rose-700' :
+                  docRiskLevel === 'MEDIUM' ? 'bg-orange-100 text-orange-700' :
+                                              'bg-emerald-100 text-emerald-700'
+                }`}>{docRiskLevel}</span>
+              </p>
+            </div>
+            <p className="text-xs text-slate-500">
+              Scores from the actual retrieved document passages — shows how unsafe the source content is.
+            </p>
+            <div className="space-y-2">
+              <RiskBadge value={result.context_toxicity_risk}  label="Toxicity Risk in Document" />
+              <RiskBadge value={result.context_bias_risk}       label="Bias Risk in Document" />
+              <RiskBadge value={result.context_manipulation}    label="Manipulation Risk in Document" />
+            </div>
+          </div>
+
+          {/* ── Answer Quality Scores ── */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-indigo-500" />
+              <p className="text-sm font-bold text-slate-700">
+                Answer Safety Scores
+                <span className="ml-2 text-xs text-slate-400 font-normal">
+                  — how safe EthicalGuard's generated answer is
+                </span>
+              </p>
+            </div>
+            <div className="space-y-2.5">
+              <ScoreBar label="Toxicity Safety"      value={result.ethical_scores.toxicity_score} />
+              <ScoreBar label="Sentiment"            value={result.ethical_scores.sentiment_score} />
+              <ScoreBar label="Bias Safety"          value={result.ethical_scores.bias_score} />
+              <ScoreBar label="Coherence"            value={result.ethical_scores.coherence_score} />
+              <ScoreBar label="Ethics (composite)"   value={result.ethical_scores.ethics_score} />
+              <ScoreBar label="Manipulation Penalty" value={result.ethical_scores.manipulation_penalty} invert />
+            </div>
+          </div>
+
           {/* Retrieved chunks toggle */}
           <button
             onClick={() => setShowChunks(v => !v)}
@@ -127,9 +202,6 @@ export default function AskDocument({ activeDocument }: Props) {
               ))}
             </div>
           )}
-
-          {/* Ethical scores */}
-          <ScoreCard scores={result.ethical_scores} title="Answer Ethical Scores" />
         </div>
       )}
     </div>
