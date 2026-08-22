@@ -30,8 +30,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Groq config
 # ---------------------------------------------------------------------------
-GROQ_PRIMARY_MODEL  = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
+GROQ_PRIMARY_MODEL  = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
+
+# Separate model for rewrite/generation — compound models return content directly
+# whereas gpt-oss models are reasoning models that output to `reasoning` field only.
+GROQ_CHAT_MODEL   = "groq/compound"
+GROQ_CHAT_FALLBACK = "groq/compound-mini"
 
 # ---------------------------------------------------------------------------
 # Module-level handles
@@ -129,9 +134,10 @@ def generate_one(prompt: str, max_tokens: int) -> str:
         raise RuntimeError("Groq client not initialized. Call load_models() first.")
 
     system_msg = (
-        "You are a helpful, respectful, and ethical AI assistant. "
-        "Produce safe, unbiased, non-toxic responses. "
-        "Be concise and direct. Avoid harmful, manipulative, or biased language."
+        "You are EthicalGuard, a helpful AI content safety analyst. "
+        "Answer in plain prose — no markdown tables, no raw pipe characters. "
+        "Use bullet points only when the user explicitly asks for a list. "
+        "Be specific, cite the text, and keep answers to 3-5 sentences."
     )
 
     # Strip Phi-3 tokens from the template — Groq chat API doesn't need them.
@@ -145,7 +151,7 @@ def generate_one(prompt: str, max_tokens: int) -> str:
         {"role": "user",   "content": user_content},
     ]
 
-    for model in [_model_name_loaded, GROQ_FALLBACK_MODEL]:
+    for model in [GROQ_CHAT_MODEL, GROQ_CHAT_FALLBACK]:
         try:
             response = _groq_client.chat.completions.create(
                 model=model,
@@ -282,15 +288,14 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
     if _groq_client is None:
         raise RuntimeError("Groq client not initialized.")
 
-    effective_max_tokens = min(max_tokens, REWRITE_MAX_TOKENS)
+    effective_max_tokens = max_tokens  # caller already passes the right value from config
 
     # Build a clean rewrite system message for Groq (strip Phi-3 tokens from template)
     rewrite_system = (
-        "You are an ethical AI rewriting assistant. "
-        "Your task is to minimally edit unsafe text. "
-        "If the sentence is already ethical, return it unchanged. "
-        "If rewriting is needed, preserve the original meaning with the smallest possible edit. "
-        "Output ONLY one final sentence. No quotes. No explanation. No labels."
+        "You are a precise text safety editor. "
+        "Make the smallest possible edit to remove toxicity, bias, or manipulation. "
+        "If the sentence is already harmless, return it exactly as given. "
+        "Output ONLY the final sentence. No quotes. No explanation. No labels."
     )
 
     # Strip Phi-3 chat tokens from REWRITE_PROMPT_TEMPLATE — Groq doesn't need them.
@@ -311,7 +316,7 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
 
         try:
             response = _groq_client.chat.completions.create(
-                model=_model_name_loaded,
+                model=GROQ_CHAT_MODEL,
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 temperature=0.5,   # lower temp for more focused rewrites
@@ -327,6 +332,10 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
         # ── Post-processing ──────────────────────────────────────────────
         cleaned = raw
 
+        # 0. Strip chain-of-thought <think>...</think> blocks (some models output these)
+        import re as _re
+        cleaned = _re.sub(r"<think>.*?</think>", "", cleaned, flags=_re.DOTALL).strip()
+
         # 1. Strip known output prefixes
         for prefix in REWRITE_OUTPUT_STRIP_PREFIXES:
             if cleaned.lower().startswith(prefix.lower()):
@@ -338,12 +347,12 @@ def generate_rewrite_candidates(input_text: str, num_candidates: int, max_tokens
         # 3. Remove markdown bullets
         cleaned = re.sub(r"^[\-\*\•]\s*", "", cleaned)
 
-        # 4. First non-empty line only
+        # 4. First non-empty line only (for single-sentence inputs)
+        # For multi-sentence inputs keep all lines joined
         lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
-        cleaned = lines[0] if lines else ""
+        cleaned = " ".join(lines) if lines else ""
 
-        # 5. Truncate to first sentence
-        cleaned = _truncate_to_first_sentence(cleaned)
+        # 5. Validate — don't truncate to first sentence for multi-sentence rewrites
         cleaned = cleaned.strip()
 
         logger.debug(f"Rewrite attempt {attempt + 1} cleaned: {repr(cleaned)}")

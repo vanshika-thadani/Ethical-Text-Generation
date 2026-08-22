@@ -38,7 +38,10 @@ export interface AskResponse {
   question: string;
   retrieved_chunks: RetrievedChunk[];
   answer: string;
-  ethical_scores: CandidateScores;
+  ethical_scores: CandidateScores;       // scores of the generated answer
+  context_toxicity_risk: number;         // worst toxicity risk across retrieved chunks
+  context_bias_risk: number;             // worst bias risk across retrieved chunks
+  context_manipulation: number;          // worst manipulation penalty across retrieved chunks
 }
 
 // POST /analyze-document

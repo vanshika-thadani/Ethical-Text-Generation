@@ -168,6 +168,15 @@ def list_documents() -> list[str]:
     return sorted({m["document"] for m in _meta})
 
 
+def get_all_chunks_for_document(document_name: str) -> list[str]:
+    """Return all stored chunk texts for a given document name."""
+    return [
+        _chunks[i]
+        for i, m in enumerate(_meta)
+        if m["document"] == document_name
+    ]
+
+
 def delete_document(document_name: str) -> int:
     before = len(_chunks)
     _remove_document_chunks(document_name)
